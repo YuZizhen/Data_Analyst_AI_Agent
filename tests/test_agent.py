@@ -150,6 +150,75 @@ def test_rank_relationships_orders_absolute_r_and_skips_unusable_fields(tmp_path
     assert "identifier: eta requires" in report
 
 
+def test_filter_and_report(tmp_path):
+    csv = tmp_path / "products.csv"
+    csv.write_text(
+        "market,category,unit_price\nSingapore,hardware,10\n singapore ,hardware,30\nMalaysia,hardware,1000\n",
+        encoding="utf-8",
+    )
+    chart = call_tool("group_report", "early", group_column="category", value_column="unit_price")
+    selection = call_tool("filter_rows", "filter", column_name="market", operator="equals", value="Singapore")
+    model = ScriptedModel([
+        AIMessage(content="", tool_calls=chart.tool_calls + selection.tool_calls),
+        call_tool("group_report", "ready", group_column="category", value_column="unit_price"),
+        AIMessage(content="Singapore hardware averages 20."),
+    ])
+    agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "Compare item prices only in Singapore."}]})
+    report = tool_trace(result["messages"])
+    assert next(step for step in report if "Deferred" in step["result"])["status"] == "error"
+    completed = [step for step in report if step["tool"] == "group_report" and step["status"] == "success"]
+    assert len(completed) == 1 and "20.0" in completed[0]["result"]
+    assert len(list(tmp_path.glob("*.png"))) == 1
+    assert result["prepared"].frame["unit_price"].tolist() == [10, 30]
+    assert "1000" in csv.read_text(encoding="utf-8")
+
+
+def test_clean_and_restore(tmp_path):
+    csv = tmp_path / "events.csv"
+    csv.write_text(
+        "day,team,revenue\n01/02/2025,A,10\n01/02/2025,A,10\n02/02/2025,B,bad\n03/02/2025, ,40\n",
+        encoding="utf-8",
+    )
+    model = ScriptedModel([
+        call_tool("profile_dataset", "profile"),
+        call_tool("convert_column", "date", column_name="day", data_type="date", date_format="%d/%m/%Y"),
+        call_tool("convert_column", "number", column_name="revenue", data_type="number"),
+        call_tool("drop_missing", "missing", columns=["team", "revenue"]),
+        call_tool("drop_duplicates", "dup"),
+        AIMessage(content="One clean row remains."),
+        call_tool("reset_dataset", "reset"),
+        AIMessage(content="All rows restored."),
+    ])
+    agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    first = agent.invoke({"messages": [{"role": "user", "content": "Prepare the data."}]})
+    working = first["prepared"]
+    assert working.frame["revenue"].tolist() == [10.0]
+    assert working.frame["day"].iloc[0].month == 2
+    assert "1 nonblank values could not be parsed" in working.steps[1]["detail"]
+    assert [step["rows_after"] for step in working.steps] == [4, 4, 2, 1]
+    restored = agent.invoke({"messages": [{"role": "user", "content": "Restore all rows."}], "prepared": working})
+    assert restored["prepared"] is None
+    assert "4 rows" in tool_trace(restored["messages"])[0]["result"]
+
+
+def test_failed_or_empty_filter_never_falls_back_to_all_rows(tmp_path):
+    model = ScriptedModel([
+        call_tool("filter_rows", "bad", column_name="missing_country", operator="equals", value="Singapore"),
+        call_tool("group_report", "blocked", group_column="town", value_column="resale_price"),
+        call_tool("filter_rows", "empty", column_name="town", operator="equals", value="no matches"),
+        call_tool("group_report", "no-data", group_column="town", value_column="resale_price"),
+        AIMessage(content="There are no matching rows."),
+    ])
+    agent = build_agent(model, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "Filter the data and then draw a chart."}]})
+    failed, blocked, empty, chart = tool_trace(result["messages"])
+    assert failed["status"] == blocked["status"] == chart["status"] == "error"
+    assert "Resolve the failed step" in blocked["result"]
+    assert empty["status"] == "success" and result["prepared"].frame.empty
+    assert not list(tmp_path.iterdir())
+
+
 def test_tool_loop_finishes_at_the_budget(tmp_path):
     model = ScriptedModel([
         *(call_tool("dataset_overview", str(turn)) for turn in range(MAX_TOOL_TURNS)),

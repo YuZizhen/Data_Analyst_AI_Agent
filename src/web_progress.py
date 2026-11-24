@@ -5,7 +5,7 @@ from html import escape
 
 from langchain.messages import AIMessage
 
-from src.agent import tool_parameters
+from src.agent import first_preparation_call, tool_parameters
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,10 @@ class Activity:
 
 METRIC_LABELS = {"mean": "平均值", "median": "中位数", "sum": "总和"}
 PERIOD_LABELS = {"day": "天", "week": "周", "month": "月", "quarter": "季度", "year": "年"}
+FILTER_LABELS = {
+    "equals": "等于", "not_equals": "不等于", "in": "属于", "contains": "包含",
+    "greater_than": "大于", "at_least": "至少为", "less_than": "小于", "at_most": "至多为",
+}
 
 
 def field_label(name) -> str:
@@ -40,6 +44,31 @@ def describe_call(name: str, args: dict) -> Activity | None:
             row_range = f"最多 {limit} 行" if isinstance(limit, int) and 1 <= limit <= 50 else "记录"
             detail = f"读取表格开头{row_range}，保留原始列。"
             return Activity("预览数据", details=(detail,))
+        case "profile_dataset":
+            return Activity("检查数据质量", details=("检查选定列的数据类型、空值和不同取值数。",))
+        case "inspect_column_values":
+            field = field_label(params.get("column_name"))
+            return Activity("查看字段取值", details=(f"检查{field}的常见值和各值的行数。",))
+        case "filter_rows":
+            field = field_label(params.get("column_name"))
+            operator = params.get("operator")
+            comparison = FILTER_LABELS.get(operator, "匹配") if isinstance(operator, str) else "匹配"
+            return Activity("筛选数据", details=(f"只保留{field}{comparison} {params.get('value')} 的行。",))
+        case "drop_missing" | "drop_duplicates":
+            columns = params.get("columns")
+            fields = "、".join(map(field_label, columns)) if isinstance(columns, list) and columns else "选定字段"
+            if name == "drop_missing":
+                return Activity("清理缺失值", details=(f"删除在{fields}中有空值的行。",))
+            fields = fields if columns else "整行"
+            return Activity("去除重复行", details=(f"按{fields}去重，保留每组首次出现的行。",))
+        case "convert_column":
+            field = field_label(params.get("column_name"))
+            data_type = params.get("data_type")
+            labels = {"number": "数值", "date": "日期", "text": "文本"}
+            label = labels.get(data_type, "指定类型") if isinstance(data_type, str) else "指定类型"
+            return Activity("转换字段类型", details=(f"将{field}转为{label}，统计无法转换的值。",))
+        case "reset_dataset":
+            return Activity("恢复原始数据", details=("清除当前筛选和转换，重新使用原始 CSV。",))
         case "average_by_group" | "group_report":
             group_column = field_label(params.get("group_column"))
             top_n = params.get("top_n")
@@ -81,8 +110,10 @@ def activity_for_update(update):
         for message in (state or {}).get("messages", []):
             if not isinstance(message, AIMessage):
                 continue
+            preparation = first_preparation_call(message.tool_calls)
+            calls = [preparation] if preparation is not None else message.tool_calls
             actions = tuple(dict.fromkeys(
-                action for call in message.tool_calls
+                action for call in calls
                 if (action := describe_call(call["name"], call["args"])) is not None
             ))
             if len(actions) == 1:

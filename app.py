@@ -95,10 +95,11 @@ def analyze(
         model = build_model(provider, model_name, api_key=api_key.strip())
         recent = [turn for turn in st.session_state.turns if turn.messages][-CONTEXT_TURNS:]
         history = [message for turn in recent for message in turn.messages]
+        prepared_before = st.session_state.get("prepared")
         with TemporaryDirectory(prefix="analyst-") as directory:
             context = AnalysisContext(dataset.frame, dataset.name, Path(directory).resolve())
             graph = build_analysis_graph(model, context)
-            inputs = {"messages": [*history, HumanMessage(content=question)]}
+            inputs = {"messages": [*history, HumanMessage(content=question)], "prepared": prepared_before}
             result = inputs
             for mode, event in graph.stream(inputs, stream_mode=["updates", "values"]):
                 if mode == "values":
@@ -115,6 +116,7 @@ def analyze(
                     path = Path(artifact["path"])
                     reports.append(Report(artifact["title"], path.name, path.read_bytes()))
         steps = tool_trace(messages)
+        prepared_after = result.get("prepared")
         trace = None
         if steps:
             trace = {
@@ -129,6 +131,13 @@ def analyze(
                 "model": {"provider": provider, "name": model_name},
                 "steps": steps,
             }
+            if prepared_before is not None or prepared_after is not None:
+                trace["working_data"] = {
+                    "before": list(prepared_before.steps) if prepared_before is not None else [],
+                    "after": list(prepared_after.steps) if prepared_after is not None else [],
+                    "rows_after": len(prepared_after.frame) if prepared_after is not None else len(dataset.frame),
+                }
+        st.session_state.prepared = prepared_after
         return Turn(question, messages, reports, trace, activity=activity)
     except MODEL_ERRORS as error:
         if isinstance(error, ConnectionError):
@@ -189,14 +198,7 @@ def main():
         st.subheader("数据源", anchor=False)
         upload = st.file_uploader("上传 CSV", type="csv")
         fingerprint, dataset = selected_dataset(upload)
-        if dataset.frame is None:
-            st.error("无法读取数据。请上传有表头和数据行的 UTF-8 CSV 文件。")
-        else:
-            st.text("HDB 转售示例（合成数据）" if dataset.is_demo else dataset.name)
-            st.caption(f"{len(dataset.frame):,} 行 · {len(dataset.frame.columns):,} 列")
-            with st.expander("查看字段"):
-                for column, dtype in dataset.frame.dtypes.items():
-                    st.text(f"{column} · {dtype}")
+        data_details = st.container()
 
         st.divider()
         st.subheader("分析模型", anchor=False)
@@ -218,22 +220,43 @@ def main():
         if st.session_state.get("scope") != scope:
             st.session_state.scope = scope
             st.session_state.turns = []
+            st.session_state.prepared = None
         st.divider()
         if st.button("新对话", width="stretch", disabled=not st.session_state.turns):
             st.session_state.turns = []
+            st.session_state.prepared = None
+
+        prepared = st.session_state.get("prepared")
+        with data_details:
+            if dataset.frame is None:
+                st.error("无法读取数据。请上传有表头和数据行的 UTF-8 CSV 文件。")
+            else:
+                st.text("HDB 转售示例（合成数据）" if dataset.is_demo else dataset.name)
+                st.caption(f"{len(dataset.frame):,} 行 · {len(dataset.frame.columns):,} 列")
+                if prepared is not None and st.button("恢复原始数据", width="stretch"):
+                    st.session_state.prepared = prepared = None
+                current_frame = dataset.frame if prepared is None else prepared.frame
+                if prepared is not None:
+                    st.caption(f"当前分析使用 {len(current_frame):,} / {len(dataset.frame):,} 行")
+                with st.expander("查看字段"):
+                    for column, dtype in current_frame.dtypes.items():
+                        st.text(f"{column} · {dtype}")
 
     st.title("数据分析工作台", anchor=False)
     st.markdown("用自然语言分析 CSV，生成可下载的图表。")
     if dataset.frame is not None:
         with st.expander("预览数据"):
-            show_preview(dataset.frame.head(DEFAULT_PREVIEW_ROWS), len(dataset.frame))
+            show_preview(current_frame.head(DEFAULT_PREVIEW_ROWS), len(current_frame))
 
     example = None
     if not st.session_state.turns and dataset.frame is not None:
         with st.container(border=True, key="start_here"):
             st.subheader("开始分析", anchor=False)
             st.markdown("选择一个示例，或在下方输入自己的问题。")
-            prompts = DEMO_QUESTIONS if dataset.is_demo else {"查看数据行": "我可以看一下这份数据吗？"}
+            prompts = DEMO_QUESTIONS if dataset.is_demo else {
+                "查看数据行": "我可以看一下这份数据吗？",
+                "检查数据质量": "请检查这份数据的字段类型、缺失值和不同取值数。",
+            }
             for area, (label, question) in zip(st.columns(len(prompts)), prompts.items()):
                 if area.button(label, width="stretch"):
                     example = question

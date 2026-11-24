@@ -5,6 +5,7 @@ A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplo
 ## Current functionality (MVP)
 
 - Inspect the schema, row count, and actual rows of the demo data or your own CSV.
+- Profile missing values and distinct values, inspect labels, filter rows, remove missing or duplicate rows, and convert columns to number, date, or text.
 - Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
@@ -39,7 +40,7 @@ Open **预览数据** above the chat to inspect the first ten rows without askin
 
 While an answer is running, an animated analyst types at a workstation and the current action appears in a thought bubble. Each bubble describes the selected analysis, including its fields and parameters. Meaningful steps move into the conversation history, while the initial waiting cue disappears. Browser reduced-motion preferences disable the animations.
 
-The latest four completed exchanges are available for follow-up questions. A new conversation starts when you change the dataset or model provider. Browser conversations and generated reports are kept in the session. Download any images you want to keep.
+The latest four completed exchanges are available for follow-up questions. Preparations apply to a working copy within the conversation. The sidebar shows how many rows are active, and **恢复原始数据** clears the preparation. Changing the dataset or model provider starts a new conversation. Browser conversations and generated reports are kept in the session. Download any images you want to keep.
 
 ### Command-line interface
 
@@ -71,11 +72,19 @@ To analyze a different CSV and choose where to save the images:
 python -m src.agent --csv path/to/sales.csv --output-dir reports/sales --question "Plot monthly total revenue."
 ```
 
-The demo CSV supports group comparisons, histograms, and scatter plots. Time trends need a CSV with a date field such as `month` or `transaction_date`. Requests for filters and custom formulas are outside the current tool set. Each interactive question runs independently, so include any context you want the analysis to use.
+The demo CSV supports group comparisons, histograms, and scatter plots. Time trends need a date column. The interactive CLI retains the prepared data until you ask to restore the original dataset or exit. Include any other context you want the analysis to use in each question.
+
+### Data preparation
+
+Upload a UTF-8 CSV from any domain, including a CSV exported from a database. Use the file's actual field names or describe the scope in natural language. For example, ask “Use only rows where the market is Singapore, then compare average unit price by product category.” Text filters ignore case and surrounding whitespace. They support exact matches, exclusions, lists, and literal substring matches. Ordered comparisons use numbers or a column already converted to dates. For non-ISO dates, give the date format explicitly.
+
+Tools can also profile the data, inspect common values, drop rows missing selected fields, deduplicate by selected fields or entire rows, and convert numbers, dates, or text. Failed conversions are counted, and an empty filter remains empty. The original CSV stays read-only. Execution records include preparation operations, parameters, and before-and-after row counts. Direct connections to live databases would require a separate data source adapter.
 
 ## How it works
 
-LangChain binds the analysis tools to the chat model. LangGraph routes simple requests to browse the dataset straight to the preview tool. For analysis requests, the `analyst` node supplies the schema and routes the model's tool calls to `ToolNode`. Results return to the model so it can choose another tool or summarize the analysis. A run allows up to six rounds of tool calls. Pandas calculates the statistics and Matplotlib renders the images. The CLI reads the actual file paths from the tool results.
+LangChain binds the analysis tools to the chat model. LangGraph routes simple browse requests straight to the preview tool. For analysis requests, the `analyst` node supplies the working schema and routes tool calls to `ToolNode`. Preparation tools update the working table in graph state. Dependent analysis calls run after that update. A run allows up to eight tool-call rounds. Pandas computes statistics and Matplotlib renders images.
+
+Tool modules live under `src/tools/`. `dataset.py` defines the shared data context, `inspection.py` shows rows and schema, `preprocessing.py` handles preparation, `charts.py` builds charts, and `relationships.py` handles association analysis.
 
 Run tests without making LLM API calls:
 
@@ -83,11 +92,12 @@ Run tests without making LLM API calls:
 python -m pytest -q
 ```
 
-## Roadmap
+## Backlog
 
-1. Add an independent validation step for grouped statistics and use the outcome to route failures to a bounded recovery step.
-2. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model.
-3. Benchmark tool selection and result accuracy on known answers, including missing values and invalid columns.
+1. Validate the scope and wording of conclusions against structured results. Independently recompute selected statistics and use the outcome to route bounded recovery.
+2. Review the suitability of analysis candidates before ranking, including numeric identifiers, constant columns, missing values, and usable sample sizes.
+3. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model, and compare the results.
+4. Add regression cases for scope selection, numerical accuracy, and conclusions that overstate the evidence.
 
 ## Safety and reproducibility
 

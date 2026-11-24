@@ -30,6 +30,10 @@ def test_progress_combines_simultaneous_tool_calls_and_ignores_result_events():
     assert "按「town」分组，计算「resale_price」的平均值" in bubble.details[0]
     assert "5 个等宽区间" in bubble.details[1]
     assert not list(activity_for_update({"tools": {"messages": []}}))
+    filter_call = call_tool("filter_rows", "3", column_name="market", operator="equals", value="Singapore")
+    mixed = AIMessage(content="", tool_calls=group.tool_calls + filter_call.tool_calls)
+    step, = activity_for_update({"analyst": {"messages": [mixed]}})
+    assert step.label == "筛选数据" and "Singapore" in step.details[0]
 
 
 def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
@@ -90,3 +94,26 @@ def test_browser_previews_actual_rows_and_records_tool_response(monkeypatch):
         "tool": "dataset_preview", "parameters": {"limit": 10}, "status": "success",
         "result": "Dataset preview ready for display. Showing 6 of 6 rows.",
     }]
+
+
+def test_browser_keeps_prepared_data_until_restored(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    model = ScriptedModel([
+        call_tool("filter_rows", "filter", column_name="town", operator="equals", value="bishan"),
+        AIMessage(content="已筛选。"),
+    ])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.chat_input[0].set_value("只保留 Bishan。").run()
+    app.run()
+    assert not app.exception
+    assert app.dataframe[0].value["town"].tolist() == ["BISHAN", "BISHAN"]
+    app.chat_input[0].set_value("我可以看一下这份数据吗？").run()
+    app.run()
+    assert not app.exception
+    assert app.dataframe[1].value["town"].tolist() == ["BISHAN", "BISHAN"]
+    assert app.session_state.turns[1].trace["working_data"]["before"][0]["tool"] == "filter_rows"
+    restore = next(button for button in app.button if button.label == "恢复原始数据")
+    restore.click().run()
+    assert not app.exception
+    assert len(app.dataframe[0].value) == 6
