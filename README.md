@@ -4,11 +4,12 @@ A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplo
 
 ## Current functionality (MVP)
 
-- Inspect the schema and row count of the demo data or your own CSV.
+- Inspect the schema, row count, and actual rows of the demo data or your own CSV.
 - Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
 - Generate multiple reports from one request, or ask for a text-only answer.
+- Inspect completed tool calls and download their parameters, outcomes, and dataset hash as JSON.
 
 > The included HDB-style CSV contains **fictional synthetic rows for testing**, not real Singapore resale transactions. Replace it with a properly licensed public dataset when ready.
 
@@ -32,6 +33,10 @@ python -m streamlit run app.py
 ```
 
 Open `http://127.0.0.1:8501`. The sidebar lets you upload a CSV, inspect its fields, and choose Ollama or OpenAI. The demo data and local `qwen3.5:4b` are selected initially unless you have set model defaults. An OpenAI key can come from the password field or `OPENAI_API_KEY` in your environment. Try an example question or type one below the conversation. Each report can be downloaded as a PNG from its message.
+
+Open **预览数据** above the chat to inspect the first ten rows without asking a model. You can also ask to see the current dataset in the chat. **查看执行记录** below a tool-backed reply shows the tools that returned results or errors and offers a JSON download.
+
+While an answer is running, an animated analyst types at a workstation and the current action appears in a thought bubble. Each bubble describes the selected analysis, including its fields and parameters. Meaningful steps move into the conversation history, while the initial waiting cue disappears. Browser reduced-motion preferences disable the animations.
 
 The latest four completed exchanges are available for follow-up questions. A new conversation starts when you change the dataset or model provider. Browser conversations and generated reports are kept in the session. Download any images you want to keep.
 
@@ -69,7 +74,7 @@ The demo CSV supports group comparisons, histograms, and scatter plots. Time tre
 
 ## How it works
 
-LangChain binds the analysis tools to the chat model. The LangGraph `analyst` node supplies the schema and routes tool calls to `ToolNode`. Results return to the model so it can choose another tool or summarize the analysis. A run allows up to six rounds of tool calls. Pandas calculates the statistics and Matplotlib renders the images. The CLI reads the actual file paths from the tool results.
+LangChain binds the analysis tools to the chat model. LangGraph routes simple requests to browse the dataset straight to the preview tool. For analysis requests, the `analyst` node supplies the schema and routes the model's tool calls to `ToolNode`. Results return to the model so it can choose another tool or summarize the analysis. A run allows up to six rounds of tool calls. Pandas calculates the statistics and Matplotlib renders the images. The CLI reads the actual file paths from the tool results.
 
 Run tests without making LLM API calls:
 
@@ -79,8 +84,9 @@ python -m pytest -q
 
 ## Roadmap
 
-1. **More analysis tools:** Add filtering and missing-data checks.
-2. **Evaluation:** Create benchmark questions with known numeric answers and track answer accuracy, tool selection, latency, and failures.
+1. Add an independent validation step for grouped statistics and use the outcome to route failures to a bounded recovery step.
+2. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model.
+3. Benchmark tool selection and result accuracy on known answers, including missing values and invalid columns.
 
 ## Safety and reproducibility
 

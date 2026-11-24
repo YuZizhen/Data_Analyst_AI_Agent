@@ -6,7 +6,30 @@ from langchain.messages import AIMessage
 from streamlit.testing.v1 import AppTest
 
 from src import agent
+from src.web_progress import Activity, activity_for_update, activity_html
 from test_agent import ScriptedModel, call_tool
+
+
+def test_activity_moves_previous_bubbles_into_the_chat_history():
+    steps = [Activity("正在检查字段"), Activity("正在绘图", "chart")]
+    running = activity_html(steps, running=True)
+    archived, scene = running.split('<div class="activity-scene">')
+    assert "正在检查字段" in archived and "正在绘图" not in archived
+    assert 'class="analyst-workstation"' in scene and 'role="status"' in scene and "正在绘图" in scene
+    finished = activity_html(steps, running=False)
+    assert "正在检查字段" in finished and "正在绘图" in finished
+    assert 'class="analyst-workstation"' not in finished and 'role="status"' not in finished
+
+
+def test_progress_combines_simultaneous_tool_calls_and_ignores_result_events():
+    group = call_tool("group_report", "1", group_column="town", value_column="resale_price")
+    histogram = call_tool("distribution_report", "2", value_column="resale_price", bins=5)
+    batch = AIMessage(content="", tool_calls=group.tool_calls + histogram.tool_calls)
+    bubble, = activity_for_update({"analyst": {"messages": [batch]}})
+    assert bubble.label == "同时执行 2 项分析"
+    assert "按「town」分组，计算「resale_price」的平均值" in bubble.details[0]
+    assert "5 个等宽区间" in bubble.details[1]
+    assert not list(activity_for_update({"tools": {"messages": []}}))
 
 
 def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
@@ -24,17 +47,46 @@ def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
     app.run()
     assert not app.exception
     assert len(app.chat_message) == 2
-    assert len(app.get("download_button")) == 1
+    assert len(app.get("download_button")) == 2
     assert app.session_state.turns[0].reports[0].image.startswith(b"\x89PNG\r\n\x1a\n")
+    step, = app.session_state.turns[0].activity
+    assert step.label == "绘制分组柱状图"
+    assert "按「town」分组，计算「resale_price」的平均值" in step.details[0]
 
     app.chat_input[0].set_value("上一轮图里最高的数值是多少？").run()
     app.run()
     assert not app.exception
     assert len(app.chat_message) == 4
     assert any("BISHAN" in message.text for message in model.last_messages)
-    assert len(app.get("download_button")) == 1
+    assert len(app.get("download_button")) == 2
+    assert len(app.session_state.turns[0].activity) == 1
+    assert not app.session_state.turns[1].activity
 
     app.radio[0].set_value("openai").run()
     assert not app.exception
     assert not app.chat_message
     assert any(widget.label == "OpenAI API Key" for widget in app.text_input)
+
+
+def test_browser_previews_actual_rows_and_records_tool_response(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    model = ScriptedModel([])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    assert any(expander.label == "预览数据" for expander in app.expander)
+    assert len(app.dataframe[0].value) == 6
+
+    app.chat_input[0].set_value("我可以看一下这个数据库吗？").run()
+    app.run()
+    assert not app.exception
+    assert app.dataframe[1].value["town"].tolist() == app.dataframe[0].value["town"].tolist()
+    assert not model.prompts
+    step, = app.session_state.turns[0].activity
+    assert step.label == "预览数据" and "最多 10 行" in step.details[0]
+    trace = app.session_state.turns[0].trace
+    assert len(trace["dataset"]["sha256"]) == 64
+    assert "resale_price" in trace["dataset"]["columns"]
+    assert trace["steps"] == [{
+        "tool": "dataset_preview", "parameters": {"limit": 10}, "status": "success",
+        "result": "Dataset preview ready for display. Showing 6 of 6 rows.",
+    }]

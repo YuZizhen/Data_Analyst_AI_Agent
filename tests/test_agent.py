@@ -7,7 +7,7 @@ from langchain.messages import AIMessage, ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer
+from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_trace
 
 
 class ScriptedModel:
@@ -104,6 +104,11 @@ def test_failed_tool_call_can_be_corrected(tmp_path):
     assert success.status == "success" and "820000" in success.content
     assert Path(success.artifact["path"]).is_file()
     assert len(list(tmp_path.iterdir())) == 1
+    failed_step, corrected_step = tool_trace(result["messages"])
+    assert failed_step["status"] == "error" and failed_step["parameters"]["group_column"] == "invalid"
+    assert corrected_step["parameters"]["aggregation"] == "mean"
+    assert corrected_step["parameters"]["top_n"] == 10
+    assert "820000" in corrected_step["result"]
 
 
 def test_tool_loop_finishes_at_the_budget(tmp_path):

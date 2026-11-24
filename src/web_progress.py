@@ -1,0 +1,139 @@
+"""Translate LangGraph updates into short, visible analysis activity messages."""
+
+from dataclasses import dataclass
+from html import escape
+
+from langchain.messages import AIMessage
+
+from src.agent import tool_parameters
+
+
+@dataclass(frozen=True)
+class Activity:
+    label: str
+    phase: str = "review"
+    details: tuple[str, ...] = ()
+
+
+METRIC_LABELS = {"mean": "平均值", "median": "中位数", "sum": "总和"}
+PERIOD_LABELS = {"day": "天", "week": "周", "month": "月", "quarter": "季度", "year": "年"}
+
+
+def field_label(name) -> str:
+    return f"「{name}」" if isinstance(name, str) and name.strip() else "待选字段"
+
+
+def describe_call(name: str, args: dict) -> Activity | None:
+    params = tool_parameters(name, args)
+    value = params.get("value_column")
+    aggregation = params.get("aggregation", "mean")
+    statistic = METRIC_LABELS.get(aggregation) if isinstance(aggregation, str) else None
+    metric = f"{field_label(value)}的{statistic}" if statistic else "指定指标"
+    if aggregation == "count":
+        metric = "记录数"
+
+    match name:
+        case "dataset_overview":
+            return Activity("查看数据结构", details=("读取列名、数据类型和总行数。",))
+        case "dataset_preview":
+            limit = params.get("limit")
+            row_range = f"最多 {limit} 行" if isinstance(limit, int) and 1 <= limit <= 50 else "记录"
+            detail = f"读取表格开头{row_range}，保留原始列。"
+            return Activity("预览数据", details=(detail,))
+        case "average_by_group" | "group_report":
+            group_column = field_label(params.get("group_column"))
+            top_n = params.get("top_n")
+            detail = f"按{group_column}分组，计算{metric}"
+            if isinstance(top_n, int) and 1 <= top_n <= 25:
+                detail += f"，按结果降序取前 {top_n} 组"
+            detail += "。"
+            if name == "group_report":
+                return Activity("绘制分组柱状图", "chart", (detail,))
+            return Activity("比较分组均值", details=(detail,))
+        case "trend_report":
+            date_column, frequency = field_label(params.get("date_column")), params.get("frequency")
+            period = PERIOD_LABELS.get(frequency, "指定时间段") if isinstance(frequency, str) else "指定时间段"
+            detail = f"以{date_column}为时间列，按{period}计算{metric}。"
+            return Activity("绘制趋势折线图", "chart", (detail,))
+        case "distribution_report":
+            bins = params.get("bins")
+            bin_count = f" {bins} 个" if isinstance(bins, int) and 1 <= bins <= 50 else "多个"
+            detail = f"把{field_label(value)}分成{bin_count}等宽区间，统计每个区间的行数。"
+            return Activity("绘制分布直方图", "chart", (detail,))
+        case "relationship_report":
+            x_column = field_label(params.get("x_column"))
+            y_column = field_label(params.get("y_column"))
+            detail = f"横轴用{x_column}，纵轴用{y_column}，并计算 Pearson 相关系数。"
+            return Activity("绘制散点图", "chart", (detail,))
+    return None
+
+
+def activity_for_update(update):
+    for node, state in update.items():
+        if node not in {"analyst", "request_preview"}:
+            continue
+        for message in (state or {}).get("messages", []):
+            if not isinstance(message, AIMessage):
+                continue
+            actions = tuple(dict.fromkeys(
+                action for call in message.tool_calls
+                if (action := describe_call(call["name"], call["args"])) is not None
+            ))
+            if len(actions) == 1:
+                yield actions[0]
+            elif actions:
+                phase = "chart" if any(action.phase == "chart" for action in actions) else "review"
+                details = tuple(f"{action.label}。{action.details[0]}" for action in actions)
+                yield Activity(f"同时执行 {len(actions)} 项分析", phase, details)
+
+
+WORKSTATION = """
+<div class="analyst-workstation" aria-hidden="true">
+    <span class="desk-shadow"></span>
+    <span class="desk-monitor">
+        <span class="desk-screen">
+            <i class="screen-grid"></i>
+            <span class="screen-bars"><i></i><i></i><i></i><i></i></span>
+        </span>
+    </span>
+    <span class="desk-surface"></span>
+    <span class="desk-keyboard"></span>
+    <span class="analyst-sleeve sleeve-left"></span>
+    <span class="analyst-sleeve sleeve-right"></span>
+    <span class="analyst-hand hand-left"></span>
+    <span class="analyst-hand hand-right"></span>
+    <span class="analyst-shirt"></span>
+    <span class="analyst-head">
+        <i class="analyst-neck"></i><i class="analyst-hair"></i>
+    </span>
+    <span class="analyst-chair"></span>
+</div>
+"""
+
+
+def activity_html(steps: list[Activity], *, running: bool) -> str:
+    def bubble_text(step: Activity) -> str:
+        details = "".join(
+            f'<span class="activity-detail">{escape(detail)}</span>'
+            for detail in getattr(step, "details", ())
+        )
+        return f'<strong class="activity-label">{escape(step.label)}</strong>{details}'
+
+    archived = steps[:-1] if running else steps
+    history = "".join(
+        f'<li class="activity-bubble activity-past">{bubble_text(step)}</li>' for step in archived
+    )
+    if history:
+        history = f'<ol class="activity-history">{history}</ol>'
+
+    scene = ""
+    state = "settled"
+    if running:
+        step = steps[-1]
+        state = f"running phase-{escape(step.phase)}"
+        scene = (
+            f'<div class="activity-scene">{WORKSTATION}'
+            f'<div class="activity-bubble activity-current" role="status">{bubble_text(step)}</div>'
+            '</div>'
+        )
+    return f'<div class="agent-activity {state}" aria-label="分析进度">{history}{scene}</div>'
