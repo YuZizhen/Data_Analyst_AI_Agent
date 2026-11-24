@@ -8,6 +8,7 @@ A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplo
 - Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
+- Compare all candidate fields against a numeric target by ranking numeric Pearson correlations and categorical correlation ratios separately, with paired sample sizes.
 - Generate multiple reports from one request, or ask for a text-only answer.
 - Inspect completed tool calls and download their parameters, outcomes, and dataset hash as JSON.
 

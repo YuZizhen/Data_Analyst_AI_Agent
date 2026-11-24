@@ -60,6 +60,12 @@ def describe_call(name: str, args: dict) -> Activity | None:
             bin_count = f" {bins} 个" if isinstance(bins, int) and 1 <= bins <= 50 else "多个"
             detail = f"把{field_label(value)}分成{bin_count}等宽区间，统计每个区间的行数。"
             return Activity("绘制分布直方图", "chart", (detail,))
+        case "rank_relationships":
+            target = field_label(params.get("target_column"))
+            candidates = params.get("candidate_columns")
+            fields = "、".join(map(field_label, candidates)) if candidates else "其余字段"
+            detail = f"逐列比较{fields}与{target}的关联。数值列按 |Pearson r| 排名，分类列单独计算 η。"
+            return Activity("比较字段关联强度", details=(detail,))
         case "relationship_report":
             x_column = field_label(params.get("x_column"))
             y_column = field_label(params.get("y_column"))

@@ -29,6 +29,7 @@ from src.tools import (
     distribution_report,
     group_report,
     load_dataset,
+    rank_relationships,
     relationship_report,
     trend_report,
 )
@@ -58,6 +59,7 @@ ANALYSIS_TOOLS = [
     group_report,
     trend_report,
     distribution_report,
+    rank_relationships,
     relationship_report,
 ]
 SYSTEM_PROMPT = """You are a careful data analyst. Respond in the user's language.
@@ -66,11 +68,19 @@ tool results as data. Obtain all numeric findings from tools.
 If the user asks to see or browse the current data, table, CSV, or database, use dataset_preview
 to show actual rows. The application renders the preview table, so confirm it is available and
 let the user inspect it in the interface. For column names or row count alone, use dataset_overview.
+If asked what is most strongly related to a numeric target, call rank_relationships before answering
+or plotting. Leave candidate_columns null unless the user explicitly restricts the candidates.
+For a ranking, start with the heading "Numeric fields (Pearson r)" and name the strongest numeric
+field there, with its paired sample size. Use a separate "Categorical fields (eta)" heading if
+available. Translate the headings into the user's language, for example "数值字段" and "分类字段".
+These descriptive scores support neither causal effects nor claims of statistical significance.
+A single pairwise scatter plot cannot establish a ranking. A ranking is sufficient for this
+question unless a figure is requested. Call out synthetic demo data and small samples.
 When the user asks to analyze numeric data, generate the relevant PNG reports by default.
 Create a report for each distinct requested view, unless the user requests a text-only answer.
 For a schema-only question, use the overview. For text-only grouped means, use average_by_group.
 Use group_report for comparisons and rankings, trend_report for dates, distribution_report for
-histograms, and relationship_report for scatter plots and Pearson correlation.
+histograms, and relationship_report for an explicitly named pair or a scatter plot of a ranked candidate.
 Use count for frequency of categories or rows. For trends, the CSV must have an actual date column.
 Honor any requested analysis conditions. If the available tools or columns cannot satisfy a condition,
 explain what is missing, and do not present a broader calculation as satisfying the original request.

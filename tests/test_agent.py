@@ -111,6 +111,45 @@ def test_failed_tool_call_can_be_corrected(tmp_path):
     assert "820000" in corrected_step["result"]
 
 
+def test_rank_relationships_compares_lease_area_and_town(tmp_path):
+    model = ScriptedModel([
+        call_tool("rank_relationships", "compare", target_column="resale_price"),
+        AIMessage(content="Among the numeric fields, remaining lease ranks highest."),
+    ])
+    agent = build_agent(model, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "那房子二手价格和什么关系最大呢"}]})
+    step, = tool_trace(result["messages"])
+    assert step["tool"] == "rank_relationships" and step["status"] == "success"
+    assert step["parameters"]["candidate_columns"] is None
+    report = step["result"]
+    assert report.index("lease_years_remaining: Pearson r = +0.481, n = 6") < report.index(
+        "floor_area_sqm: Pearson r = +0.110, n = 6"
+    )
+    assert "town: eta = 0.954, n = 6, groups = 3" in report
+
+
+def test_rank_relationships_orders_absolute_r_and_skips_unusable_fields(tmp_path):
+    csv = tmp_path / "sample.csv"
+    csv.write_text(
+        "target,negative,weak,constant,sparse,label,identifier\n"
+        "1,6,1,1,1,A,id1\n2,5,3,1,inf,A,id2\n3,4,2,1,3,A,id3\n"
+        "4,3,2,1,,B,id4\n5,2,3,1,,B,id5\n6,1,1,1,,B,id6\n",
+        encoding="utf-8",
+    )
+    model = ScriptedModel([
+        call_tool("rank_relationships", "compare", target_column="target"),
+        AIMessage(content="Analysis complete."),
+    ])
+    agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "Which field is most related to target?"}]})
+    report = tool_trace(result["messages"])[0]["result"]
+    assert report.index("negative: Pearson r = -1.000") < report.index("weak: Pearson r")
+    assert "label: eta = " in report
+    assert "constant: Pearson r requires" in report
+    assert "sparse: Pearson r requires" in report
+    assert "identifier: eta requires" in report
+
+
 def test_tool_loop_finishes_at_the_budget(tmp_path):
     model = ScriptedModel([
         *(call_tool("dataset_overview", str(turn)) for turn in range(MAX_TOOL_TURNS)),
