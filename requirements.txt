@@ -1,0 +1,8 @@
+langchain>=1.0,<2.0
+langgraph>=1.0,<2.0
+langchain-openai
+pandas>=2.0
+matplotlib>=3.8
+python-dotenv
+pytest
+streamlit
