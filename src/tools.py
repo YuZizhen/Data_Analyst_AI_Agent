@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import pandas as pd
 from langchain.tools import ToolRuntime, tool
@@ -24,7 +24,7 @@ class AnalysisContext:
     output_dir: Path
 
 
-def load_dataset(path: Path = DATA_PATH) -> pd.DataFrame:
+def load_dataset(path: Path | BinaryIO = DATA_PATH) -> pd.DataFrame:
     """Load a CSV, defaulting to the repository's demonstration dataset."""
     return pd.read_csv(path)
 

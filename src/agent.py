@@ -33,6 +33,7 @@ load_dotenv()
 DEFAULT_OUTPUT_DIR = DATA_PATH.parent.parent / "reports"
 MAX_TOOL_TURNS = 6
 MODEL_ERRORS = (OpenAIError, ResponseError, ConnectionError, RequestError)
+MODEL_DEFAULTS = {"ollama": ("OLLAMA_MODEL", "qwen3.5:4b"), "openai": ("OPENAI_MODEL", "gpt-4o-mini")}
 ANALYSIS_TOOLS = [
     dataset_overview,
     average_by_group,
@@ -55,7 +56,7 @@ explain what is missing, and do not present a broader calculation as satisfying 
 Ask a focused question when the needed metric or column is genuinely ambiguous.
 Summarize only verified results, mention exclusions or limitations, and distinguish correlation
 from causation. Keep category labels as written and use units or currencies only when specified.
-Only claim a report was created after a tool confirms success. The application prints the actual
+Only claim a report was created after a tool confirms success. The application presents the actual
 report paths. Do not guess or repeat file paths."""
 
 
@@ -63,22 +64,29 @@ class AnalysisState(MessagesState):
     tool_turns: int
 
 
-def build_model(provider: str | None = None, model_name: str | None = None):
+def default_model_name(provider: str) -> str:
+    environment_key, fallback = MODEL_DEFAULTS[provider]
+    return os.getenv(environment_key) or fallback
+
+
+def build_model(provider: str | None = None, model_name: str | None = None, *, api_key: str | None = None):
     """Select a chat model from command-line overrides or environment settings."""
     provider = provider or os.getenv("MODEL_PROVIDER") or "openai"
+    if provider not in MODEL_DEFAULTS:
+        raise ValueError(f"Unknown model provider {provider!r}. Choose openai or ollama.")
+    model_name = model_name or default_model_name(provider)
     if provider == "ollama":
         return ChatOllama(
-            model=model_name or os.getenv("OLLAMA_MODEL") or "qwen3.5:4b",
+            model=model_name,
             base_url=os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
             temperature=0,
             reasoning=False,
             client_kwargs={"timeout": Timeout(180, connect=5), "trust_env": False},
         )
-    if provider != "openai":
-        raise ValueError(f"Unknown model provider {provider!r}. Choose openai or ollama.")
-    if os.getenv("OPENAI_API_KEY", "").strip() in {"", "replace-with-your-own-api-key"}:
+    api_key = (api_key or os.getenv("OPENAI_API_KEY", "")).strip()
+    if api_key in {"", "replace-with-your-own-api-key"}:
         raise ValueError("Set OPENAI_API_KEY for OpenAI, or select --provider ollama for a local model.")
-    return ChatOpenAI(model=model_name or os.getenv("OPENAI_MODEL") or "gpt-4o-mini", timeout=30)
+    return ChatOpenAI(model=model_name, api_key=api_key, timeout=30)
 
 
 def build_agent(model=None, *, csv_path: Path = DATA_PATH, output_dir: Path = DEFAULT_OUTPUT_DIR):
@@ -87,8 +95,11 @@ def build_agent(model=None, *, csv_path: Path = DATA_PATH, output_dir: Path = DE
     if csv_path == DATA_PATH:
         source += " (synthetic demo)"
     context = AnalysisContext(load_dataset(csv_path), source, Path(output_dir).resolve())
-    if model is None:
-        model = build_model()
+    return build_analysis_graph(build_model() if model is None else model, context)
+
+
+def build_analysis_graph(model, context: AnalysisContext):
+    """Bind the shared workflow to a dataset and a report directory."""
     tool_options = {"parallel_tool_calls": False} if isinstance(model, ChatOpenAI) else {}
     model_with_tools = model.bind_tools(ANALYSIS_TOOLS, **tool_options)
 
@@ -118,9 +129,14 @@ def print_answer(agent, question: str):
     result = agent.invoke({"messages": [{"role": "user", "content": question}]})
     messages = result["messages"]
     print(f"\nAnswer:\n{messages[-1].text}")
+    for artifact in report_artifacts(messages):
+        print(f"\nPNG report — {artifact['title']}\n{artifact['path']}")
+
+
+def report_artifacts(messages):
     for message in messages:
         if isinstance(message, ToolMessage) and message.status == "success" and message.artifact:
-            print(f"\nPNG report — {message.artifact['title']}\n{message.artifact['path']}")
+            yield message.artifact
 
 
 def model_error_message(error: Exception) -> str:

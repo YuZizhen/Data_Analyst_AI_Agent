@@ -6,4 +6,4 @@ pandas>=2.0
 matplotlib>=3.8
 python-dotenv
 pytest
-streamlit
+streamlit>=1.56,<2

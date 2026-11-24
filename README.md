@@ -1,6 +1,6 @@
 # Agentic Data Analyst
 
-A CLI data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplotlib**. Ask a question in natural language. The agent chooses the analysis functions, summarizes their results, and returns the paths to any PNG reports it creates.
+A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplotlib**, with a local browser interface and a CLI. Ask a question in natural language. The agent chooses the analysis functions, summarizes their results, and generates PNG reports.
 
 ## Current functionality (MVP)
 
@@ -23,7 +23,21 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-### Local Ollama
+### Browser interface
+
+Start Ollama for local inference, then launch the interface from the project directory:
+
+```bash
+python -m streamlit run app.py
+```
+
+Open `http://127.0.0.1:8501`. The sidebar lets you upload a CSV, inspect its fields, and choose Ollama or OpenAI. The demo data and local `qwen3.5:4b` are selected initially unless you have set model defaults. An OpenAI key can come from the password field or `OPENAI_API_KEY` in your environment. Try an example question or type one below the conversation. Each report can be downloaded as a PNG from its message.
+
+The latest four completed exchanges are available for follow-up questions. A new conversation starts when you change the dataset or model provider. Browser conversations and generated reports are kept in the session. Download any images you want to keep.
+
+### Command-line interface
+
+#### Local Ollama
 
 Start Ollama and check that the model you want appears in `ollama list`. The agent defaults to `qwen3.5:4b` in Ollama mode. To choose any installed model that supports tool calling, pass its exact tag to `--model`.
 
@@ -33,7 +47,7 @@ python -m src.agent --provider ollama --model qwen3.5:4b --question "Compare ave
 
 This mode needs no OpenAI API key. It connects to `http://127.0.0.1:11434` by default. Set `OLLAMA_BASE_URL` in `.env` if your Ollama server runs at a different address. Ollama manages model storage through its own settings, including `OLLAMA_MODELS`.
 
-### OpenAI API
+#### OpenAI API
 
 Set `OPENAI_API_KEY` in your environment or copy `.env.example` to `.env` and set it there. OpenAI remains the default provider and defaults to `gpt-4o-mini`.
 
@@ -41,7 +55,7 @@ Set `OPENAI_API_KEY` in your environment or copy `.env.example` to `.env` and se
 python -m src.agent --provider openai --model gpt-4o-mini --question "Compare average resale price by town."
 ```
 
-### Defaults and data files
+#### Defaults and data files
 
 Set `MODEL_PROVIDER` to `ollama` or `openai` in `.env` to choose the default for your workspace. Set `OLLAMA_MODEL` or `OPENAI_MODEL` to save a default model for that provider. `--provider` and `--model` take precedence. Omit `--question` for interactive use. Both providers save PNGs under `reports/` by default.
 
@@ -66,12 +80,11 @@ python -m pytest -q
 ## Roadmap
 
 1. **More analysis tools:** Add filtering and missing-data checks.
-2. **Streamlit UI:** Upload a CSV, ask questions, view charts, and inspect tool traces.
-3. **Evaluation:** Create benchmark questions with known numeric answers and track answer accuracy, tool selection, latency, and failures.
+2. **Evaluation:** Create benchmark questions with known numeric answers and track answer accuracy, tool selection, latency, and failures.
 
 ## Safety and reproducibility
 
-- Treat CSVs as read-only inputs. Only the configured report directory receives generated files.
+- Treat CSVs as read-only inputs. The CLI saves images to the configured report directory. The browser interface prepares downloads using temporary files.
 - The model receives the question, schema, and tool results, which can include category labels and statistics. Choose data you are authorized to share with the model provider.
 - Keep credentials out of source control.
 - Add dataset source/licensing information when switching from synthetic data to public data.

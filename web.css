@@ -1,0 +1,46 @@
+.stMainBlockContainer {
+    max-width: 60rem;
+    padding-top: 4rem;
+}
+
+[data-testid="stBottomBlockContainer"] {
+    max-width: 60rem;
+}
+
+[data-testid="stAppDeployButton"] {
+    display: none;
+}
+
+[data-testid="stSidebar"] {
+    border-right: 1px solid #dce6ee;
+}
+
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.75rem;
+}
+
+.st-key-start_here {
+    background: #edf5f4;
+    border-radius: 1rem;
+    padding: clamp(0.75rem, 2vw, 1.5rem);
+}
+
+[data-testid="stChatMessage"] {
+    background: #fff;
+    border: 1px solid #dce6ee;
+    border-radius: 0.9rem;
+}
+
+[data-testid="stChatMessage"] pre {
+    font-family: inherit;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+[data-testid="stImage"] img {
+    border-radius: 0.6rem;
+}
+
+@media (max-width: 640px) {
+    .stMainBlockContainer { padding-top: 3.5rem; }
+}
