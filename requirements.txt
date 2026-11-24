@@ -1,6 +1,7 @@
 langchain>=1.0,<2.0
 langgraph>=1.0,<2.0
 langchain-openai
+langchain-ollama>=1.2,<2
 pandas>=2.0
 matplotlib>=3.8
 python-dotenv

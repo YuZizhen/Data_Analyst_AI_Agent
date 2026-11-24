@@ -5,6 +5,7 @@ A CLI data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Ma
 ## Current functionality (MVP)
 
 - Inspect the schema and row count of the demo data or your own CSV.
+- Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
 - Generate multiple reports from one request, or ask for a text-only answer.
@@ -22,17 +23,27 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env`, then set `OPENAI_API_KEY` in `.env` (never commit this file). Run:
+### Local Ollama
+
+Start Ollama and check that the model you want appears in `ollama list`. The agent defaults to `qwen3.5:4b` in Ollama mode. To choose any installed model that supports tool calling, pass its exact tag to `--model`.
 
 ```bash
-python -m src.agent
+python -m src.agent --provider ollama --model qwen3.5:4b --question "Compare average resale price by town and plot the distribution of resale prices."
 ```
 
-To run a single question and save the default dataset's reports under `reports/`:
+This mode needs no OpenAI API key. It connects to `http://127.0.0.1:11434` by default. Set `OLLAMA_BASE_URL` in `.env` if your Ollama server runs at a different address. Ollama manages model storage through its own settings, including `OLLAMA_MODELS`.
+
+### OpenAI API
+
+Set `OPENAI_API_KEY` in your environment or copy `.env.example` to `.env` and set it there. OpenAI remains the default provider and defaults to `gpt-4o-mini`.
 
 ```bash
-python -m src.agent --question "Compare average resale price by town and plot the distribution of resale prices."
+python -m src.agent --provider openai --model gpt-4o-mini --question "Compare average resale price by town."
 ```
+
+### Defaults and data files
+
+Set `MODEL_PROVIDER` to `ollama` or `openai` in `.env` to choose the default for your workspace. Set `OLLAMA_MODEL` or `OPENAI_MODEL` to save a default model for that provider. `--provider` and `--model` take precedence. Omit `--question` for interactive use. Both providers save PNGs under `reports/` by default.
 
 To analyze a different CSV and choose where to save the images:
 
@@ -69,3 +80,4 @@ python -m pytest -q
 
 - [LangChain Quickstart](https://docs.langchain.com/oss/python/langchain/quickstart)
 - [LangGraph Quickstart](https://docs.langchain.com/oss/python/langgraph/quickstart)
+- [LangChain ChatOllama integration](https://docs.langchain.com/oss/python/integrations/chat/ollama)

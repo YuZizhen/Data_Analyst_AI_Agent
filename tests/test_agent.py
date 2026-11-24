@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
+import pytest
 from langchain.messages import AIMessage, ToolMessage
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
-from src.agent import MAX_TOOL_TURNS, build_agent, print_answer
+from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer
 
 
 class ScriptedModel:
@@ -25,6 +28,30 @@ class ScriptedModel:
 
 def call_tool(name, call_id, **args):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+def test_ollama_can_use_an_installed_model_without_an_openai_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:4b")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435")
+    model = build_model()
+    assert isinstance(model, ChatOllama)
+    assert model.model == "qwen3.5:4b"
+    assert model.base_url == "http://127.0.0.1:11435"
+    assert build_model("ollama", "another-model:latest").model == "another-model:latest"
+
+
+def test_openai_override_requires_a_key_and_uses_the_requested_model(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        build_model("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = build_model("openai", "other-api-model")
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_name == "other-api-model"
 
 
 def test_multiple_pngs(tmp_path, capsys):
