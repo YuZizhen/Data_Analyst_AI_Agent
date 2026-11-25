@@ -1,8 +1,14 @@
 # Agentic Data Analyst
 
-A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplotlib**, with a local browser interface and a CLI. Ask a question in natural language. The agent chooses the analysis functions, summarizes their results, and generates PNG reports.
+A self-validating data analysis agent built with **LangChain**, **LangGraph**, **Pandas**, and **Matplotlib**. Ask a question in the browser or CLI to inspect a CSV, prepare the data, and generate downloadable PNG reports.
 
-## Current functionality (MVP)
+## What makes it different
+
+- **Dynamic tool selection.** The model chooses inspection, cleaning, statistics, and chart tools based on the question and the current table. A single request can filter rows, compute a statistic, and create several reports.
+- **Self-validation and recovery.** A LangGraph node checks the data scope, independently recomputes supported statistics, and scans the draft for common claims that exceed the evidence. It can send the analysis back for one correction within the tool budget.
+- **Traceable and reproducible preparation.** The browser keeps originals and cleaned versions, shows the cleaning code, and exports a replay script. Each analysis record captures the dataset hash, tool parameters, results, and any validation attempts.
+
+## Current functionality
 
 - Inspect the schema, row count, and actual rows of the demo data or your own CSV.
 - Profile missing values and distinct values, inspect labels, filter rows, remove missing or duplicate rows, and convert columns to number, date, or text.
@@ -35,17 +41,27 @@ Start Ollama for local inference, then launch the interface from the project dir
 python -m streamlit run app.py
 ```
 
-Open `http://127.0.0.1:8501`. The sidebar lets you upload a CSV, inspect its fields, and choose Ollama or OpenAI. The demo data and local `qwen3.5:4b` are selected initially unless you have set model defaults. An OpenAI key can come from the password field or `OPENAI_API_KEY` in your environment. Try an example question or type one below the conversation. Each report can be downloaded as a PNG from its message.
+Open `http://127.0.0.1:8501`. The sidebar lets you upload a CSV, inspect its fields, and choose Ollama or OpenAI. The demo data and local `qwen3.5:4b` are selected initially unless you have set model defaults. In Ollama mode, enter the exact tag of an installed model that supports tool calling. In OpenAI mode, enter an API key or set `OPENAI_API_KEY` in your environment. Try an example question or type one below the conversation. Each report can be downloaded as a PNG from its message.
 
 Open **预览数据** above the chat to inspect the first ten rows without asking a model. You can also ask to see the current dataset in the chat. **查看执行记录** below a tool-backed reply shows the tools that returned results or errors and offers a JSON download.
 
-The execution record opens to **分析旅程**, which explains the purpose, parameters, and recorded results of each tool step in Chinese. The **原始工具数据** tab preserves the exact tool parameters and outputs. Both views come from the recorded calls and are included in the JSON download.
+The execution record opens to **分析旅程**, which explains the purpose, parameters, and recorded results of each tool step in Chinese. **校验结果** shows the checks and outcomes for numerical analysis when validation runs. **原始工具数据** preserves the exact tool parameters and outputs. The JSON download includes the tool calls, the journey, and any validation attempts.
 
 While an answer is running, an animated analyst types at a workstation and the current action appears in a thought bubble. Each bubble describes the selected analysis, including its fields and parameters. Meaningful steps move into the conversation history, while the initial waiting cue disappears. Browser reduced-motion preferences disable the animations.
 
 The sidebar's **当前使用的数据表** selector lists uploaded originals and saved cleaned versions. Successful preparation creates or reuses a version and selects it for follow-up questions. The originals and versions are stored locally as Parquet under `data/private/datasets/`, which is excluded from Git. Manual table or model-provider changes start a new conversation. The **恢复原始数据** button selects the original table. The last four exchanges provide chat context within a conversation.
 
 For a cleaned version, open **清洗逻辑与代码** to see each operation, its parameters and row counts, a replay script for the saved original, the actual Python implementations, and a CSV download. Run the replay script from the project environment. It writes a separate output file.
+
+### Try it with the demo CSV
+
+Use the original demo table for each example. The filtering example saves and selects a filtered version.
+
+| Ask in the chat | What to look for |
+| --- | --- |
+| 我可以看一下这个数据库吗？ | A preview of the active table in the chat. |
+| 只看 `town = BISHAN`，按 `town` 画 `resale_price` 的均价图。 | A saved filtered table, a chart, and a validation record showing how many rows matched and the independently recomputed mean. |
+| 哪些字段与 `resale_price` 的关联最强？ | Separate rankings for numeric and categorical fields, with sample sizes and a partial validation status. |
 
 ### Command-line interface
 
@@ -89,13 +105,23 @@ Tools can also profile the data, inspect common values, drop rows missing select
 
 Ask for the top N factors predicting a numeric column and their shares. The tool trains a random forest with three shuffled validation folds, shuffles each original factor independently, and measures the change in mean absolute error (MAE). The share divides each positive mean increase by the total across all positive factors. The chart shows the top N and groups the remaining positive shares under **Other factors**. Shares describe how this model uses the supplied data. Correlated factors can split or mask importance. Use only candidate fields available when making the prediction.
 
-The tool needs at least 30 working rows with valid targets and checks that validation MAE beats a median baseline. The six-row HDB demo supports descriptive relationship rankings. It is too small for a predictive importance report. The browser's evidence panel and the model's explanation use the held-out MAE comparison and per-fold stability counts. These counts describe this validation setup, and further checks are needed to establish causation or performance on other data.
+The tool needs at least 30 working rows with valid targets. It reports validation MAE against a median baseline and counts how many folds beat the baseline. The six-row HDB demo supports descriptive relationship rankings. Use a larger CSV for predictive importance. The browser's **因素重要性怎么解读** panel shows the baseline comparison, the percentage shares, and how stable the rankings were across the folds. These scores describe predictive performance on the supplied data. Establishing causation or generalization requires additional evidence.
+
+## Validation and recovery
+
+When validation runs, the progress bubble shows **正在校验**. Open **查看执行记录 → 校验结果** to see what the agent checked, the evidence or recomputed values, and any retry. The answer displays **校验通过**, **部分校验**, or **校验未通过**.
+
+| Check | Current coverage |
+| --- | --- |
+| Data scope | Replays recorded cleaning and filters, compares the rebuilt table with the input used by the tool, and checks explicit conditions such as `market = Singapore`. |
+| Independent recalculation | Recomputes grouped statistics, pairwise Pearson correlations, and the median and range of distributions. Trends, field association rankings, and feature importance have partial coverage. |
+| Conclusion wording | Scans the draft for common unsupported causal or statistical significance claims. This is a wording check. Cross-checking every number stated in the answer is on the backlog. |
+
+If a check fails, the agent can retry once within the tool-call budget. Rejected charts are excluded from the answer, and the execution record keeps the findings from each attempt.
 
 ## How it works
 
-LangChain binds the analysis tools to the chat model. LangGraph routes simple browse requests straight to the preview tool. For analysis requests, the `analyst` node supplies the working schema and routes tool calls to `ToolNode`. Preparation tools update the working table in graph state. Dependent analysis calls run after that update. A run allows up to eight tool-call rounds. Pandas computes statistics and Matplotlib renders images.
-
-Before displaying a numerical analysis, the `validate` node replays recorded preparation and compares the reconstructed data with the tool input. It checks explicit filters like `market = Singapore` and independently recomputes group summaries, pairwise Pearson correlations, and distribution summaries. It scans the draft for common unsupported causal or statistical-significance claims. The browser shows the current check in the activity bubble and saves each attempt under **查看执行记录 → 校验结果** and in the downloadable JSON. A failed check can route back to the analyst once within the tool budget. Rejected charts are excluded from the answer. Other statistical tools can show partial coverage while independent recalculation is pending.
+LangChain binds the analysis tools to the chat model. LangGraph routes simple browse requests straight to the preview tool. For analysis requests, the `analyst` node supplies the working schema and routes tool calls to `ToolNode`. Preparation tools update the active table in graph state before dependent calls run. The `validate` node checks numerical analysis before the reply is displayed and can route back to `analyst` for recovery. A run allows up to eight tool-call rounds. Pandas computes statistics and Matplotlib renders images.
 
 Tool modules live under `src/tools/`. `dataset.py` defines the shared data context, `inspection.py` shows rows and schema, `preprocessing.py` handles preparation, `charts.py` builds charts, `relationships.py` handles association analysis, and `importance.py` produces predictive importance reports.
 
