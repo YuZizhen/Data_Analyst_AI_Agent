@@ -18,6 +18,7 @@ from src.agent import (
     build_analysis_graph,
     build_model,
     default_model_name,
+    messages_for_model,
     model_error_message,
     tool_artifacts,
     tool_trace,
@@ -26,7 +27,7 @@ from src import table_store
 from src.table_store import SavedTable, TableStore
 from src.tools import DATA_PATH, DEFAULT_PREVIEW_ROWS, AnalysisContext, PreparedDataset
 from src.web_journey import describe_journey
-from src.web_progress import Activity, activity_for_update, activity_html, describe_call
+from src.web_progress import Activity, activity_for_update, activity_html, describe_call, update_validation_activity
 
 DEMO_QUESTIONS = {
     "比较各区转售价": "生成各区平均转售价的柱状图，并指出哪个区最高。",
@@ -34,6 +35,7 @@ DEMO_QUESTIONS = {
     "分析面积与价格": "画一张房屋面积与转售价的散点图，并解释相关性。",
 }
 CONTEXT_TURNS = 4
+VALIDATION_STATUSES = {"passed": "通过", "limited": "部分覆盖", "failed": "未通过"}
 
 
 @dataclass(frozen=True)
@@ -107,16 +109,22 @@ def analyze(
         model_name = model_name.strip() or default_model_name(provider)
         model = build_model(provider, model_name, api_key=api_key.strip())
         recent = [turn for turn in st.session_state.turns if turn.messages][-CONTEXT_TURNS:]
-        history = [message for turn in recent for message in turn.messages]
+        history = [
+            message for turn in recent
+            for message in messages_for_model(turn.messages, (turn.trace or {}).get("rejected_tool_calls", []))
+        ]
         prepared_before = PreparedDataset(dataset.frame, dataset.selected.steps) if dataset.selected.steps else None
         with TemporaryDirectory(prefix="analyst-") as directory:
             context = AnalysisContext(dataset.source_frame, dataset.original.name, Path(directory).resolve())
             graph = build_analysis_graph(model, context)
             inputs = {"messages": [*history, HumanMessage(content=question)], "prepared": prepared_before}
             result = inputs
-            for mode, event in graph.stream(inputs, stream_mode=["updates", "values"]):
+            for mode, event in graph.stream(inputs, stream_mode=["updates", "values", "custom"]):
                 if mode == "values":
                     result = event
+                elif mode == "custom":
+                    if update_validation_activity(activity, event):
+                        show_activity(activity)
                 else:
                     for step in activity_for_update(event):
                         if step not in activity:
@@ -124,11 +132,12 @@ def analyze(
                             show_activity(activity)
             messages = result["messages"][len(history):]
             reports = []
-            for artifact in tool_artifacts(messages):
+            rejected = result.get("rejected_tool_calls", [])
+            for artifact in tool_artifacts(messages, rejected):
                 if "path" in artifact:
                     path = Path(artifact["path"])
                     reports.append(Report(artifact["title"], path.name, path.read_bytes(), artifact.get("feature_importance")))
-        steps = tool_trace(messages)
+        steps = tool_trace(messages, rejected)
         prepared_after = result.get("prepared")
         active_after = dataset.original
         if prepared_after is not None:
@@ -151,6 +160,10 @@ def analyze(
                 "input_table": {"label": dataset.selected.label, "rows": len(dataset.frame), "columns": len(dataset.frame.columns)},
                 "steps": steps,
             }
+            if validation := result.get("validation"):
+                trace["validation"] = validation
+            if rejected:
+                trace["rejected_tool_calls"] = rejected
             if evidence := [report.evidence for report in reports if report.evidence is not None]:
                 trace["feature_importance"] = evidence
             if prepared_before is not None or prepared_after is not None:
@@ -220,8 +233,10 @@ def show_importance_evidence(evidence: dict):
 
 def show_execution_record(turn: Turn, trace: dict):
     journey = describe_journey(trace["steps"])
+    validation = trace.get("validation", [])
     with st.expander("查看执行记录"):
-        journey_tab, raw_tab = st.tabs(["分析旅程", "原始工具数据"])
+        tabs = ["分析旅程", "校验结果", "原始工具数据"] if validation else ["分析旅程", "原始工具数据"]
+        journey_tab, *validation_tabs, raw_tab = st.tabs(tabs)
         with journey_tab:
             st.markdown("**本轮问题**")
             st.text(trace["question"])
@@ -237,6 +252,8 @@ def show_execution_record(turn: Turn, trace: dict):
                     st.markdown(f"**{number}. {step['action']}**")
                     round_label = f"第 {step['round']} 轮 · " if step["round"] is not None else ""
                     st.caption(f"{round_label}{step['status']}")
+                    if trace["steps"][number - 1].get("rejected_by_validation"):
+                        st.caption("校验未通过，结果已排除。")
                     if step["purpose"]:
                         st.text(f"用途 · {step['purpose']}")
                     for detail in step["method"]:
@@ -246,6 +263,19 @@ def show_execution_record(turn: Turn, trace: dict):
                     for table in step["tables"]:
                         st.caption(table["title"])
                         st.dataframe(table["rows"], hide_index=True, width="stretch")
+        if validation_tabs:
+            with validation_tabs[0]:
+                for attempt in validation:
+                    with st.container(border=True):
+                        status = VALIDATION_STATUSES[attempt["status"]]
+                        st.markdown(f"**第 {attempt['attempt']} 次校验 · {status}**")
+                        for item in attempt["checks"]:
+                            tool = describe_call(item["tool"], {}) if item["tool"] else None
+                            method = f"{tool.label} · " if tool else ""
+                            st.text(f"{method}{item['label']} · {VALIDATION_STATUSES[item['status']]}")
+                            st.caption(item["detail"])
+                        if attempt["retrying"]:
+                            st.caption("已根据这次校验的发现发起重试。")
         with raw_tab:
             for number, step in enumerate(trace["steps"], start=1):
                 st.text(f"{number}. {step['tool']} · {journey[number - 1]['status']}")
@@ -269,6 +299,16 @@ def show_turn(turn: Turn):
             st.error(turn.error)
             return
         st.markdown(turn.messages[-1].text or "分析已完成。")
+        trace = getattr(turn, "trace", None)
+        if trace and (validation := trace.get("validation")):
+            last = validation[-1]["status"]
+            label, render = {
+                "passed": ("校验通过", st.success),
+                "limited": ("部分校验 · 查看已核对的内容和复算范围", st.warning),
+                "failed": ("校验未通过", st.error),
+            }[last]
+            retry_note = " · 已重试一次" if len(validation) > 1 else ""
+            render(f"{label}{retry_note}")
         for artifact in tool_artifacts(turn.messages):
             if "table" in artifact:
                 show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])
@@ -282,7 +322,6 @@ def show_turn(turn: Turn):
                     "下载 PNG", report.image, report.filename, mime="image/png",
                     key=report.filename, on_click="ignore",
                 )
-        trace = getattr(turn, "trace", None)
         if trace:
             show_execution_record(turn, trace)
 

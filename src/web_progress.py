@@ -128,6 +128,30 @@ def activity_for_update(update):
                 yield Activity(f"同时执行 {len(actions)} 项分析", phase, details)
 
 
+VALIDATION_ACTIVITIES = {
+    "scope": Activity("正在校验", "validation", ("按清洗与筛选步骤重建工具使用的数据。",)),
+    "numbers": Activity("正在校验", "validation", ("独立复算已覆盖的统计量，并与工具结果对照。",)),
+    "conclusion": Activity("正在校验", "validation", ("检查结论里是否有超出数据证据的表述。",)),
+    "retry": Activity("校验发现问题，正在纠正", "validation", ("根据校验记录纠正数据、计算或结论，再校验一次。",)),
+}
+
+
+def update_validation_activity(activity: list[Activity], event: dict) -> bool:
+    if event.get("event") != "validation" or (step := VALIDATION_ACTIVITIES.get(event.get("stage"))) is None:
+        return False
+    if step.label == "正在校验" and activity and activity[-1].label == step.label:
+        if event["stage"] == "numbers":
+            details = (*VALIDATION_ACTIVITIES["scope"].details, *step.details)
+        elif event["stage"] == "conclusion":
+            details = (*activity[-1].details, *step.details)
+        else:
+            details = step.details
+        activity[-1] = Activity(step.label, step.phase, details)
+    else:
+        activity.append(step)
+    return True
+
+
 WORKSTATION = """
 <div class="analyst-workstation" aria-hidden="true">
     <span class="desk-shadow"></span>

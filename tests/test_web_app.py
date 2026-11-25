@@ -59,9 +59,14 @@ def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
     assert len(app.chat_message) == 2
     assert len(app.get("download_button")) == 2
     assert app.session_state.turns[0].reports[0].image.startswith(b"\x89PNG\r\n\x1a\n")
-    step, = app.session_state.turns[0].activity
+    step, validation = app.session_state.turns[0].activity
     assert step.label == "绘制分组柱状图"
     assert "按「town」分组，计算「resale_price」的平均值" in step.details[0]
+    assert validation.label == "正在校验" and any("独立复算" in item for item in validation.details)
+    assert any(item.label == "校验结果" for item in app.tabs)
+    assert any(item.value == "校验通过" for item in app.success)
+    assert any("用 Python 逐组重算了" in item.value for item in app.caption)
+    assert app.session_state.turns[0].trace["validation"][0]["status"] == "passed"
 
     app.chat_input[0].set_value("上一轮图里最高的数值是多少？").run()
     app.run()
@@ -69,7 +74,7 @@ def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
     assert len(app.chat_message) == 4
     assert any("BISHAN" in message.text for message in model.last_messages)
     assert len(app.get("download_button")) == 2
-    assert len(app.session_state.turns[0].activity) == 1
+    assert len(app.session_state.turns[0].activity) == 2
     assert not app.session_state.turns[1].activity
 
     app.radio[0].set_value("openai").run()
@@ -119,6 +124,7 @@ def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypa
     assert numeric["Pearson r"].tolist() == ["+0.481", "+0.110"]
     assert categorical["相关比 η"].tolist() == ["0.954"]
     assert any("lease_years_remaining: Pearson r = +0.481" in item.value for item in app.code)
+    assert any("部分校验" in item.value for item in app.warning)
 
 
 def test_browser_keeps_prepared_data_until_restored(monkeypatch):

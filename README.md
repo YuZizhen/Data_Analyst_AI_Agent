@@ -95,6 +95,8 @@ The tool needs at least 30 working rows with valid targets and checks that valid
 
 LangChain binds the analysis tools to the chat model. LangGraph routes simple browse requests straight to the preview tool. For analysis requests, the `analyst` node supplies the working schema and routes tool calls to `ToolNode`. Preparation tools update the working table in graph state. Dependent analysis calls run after that update. A run allows up to eight tool-call rounds. Pandas computes statistics and Matplotlib renders images.
 
+Before displaying a numerical analysis, the `validate` node replays recorded preparation and compares the reconstructed data with the tool input. It checks explicit filters like `market = Singapore` and independently recomputes group summaries, pairwise Pearson correlations, and distribution summaries. It scans the draft for common unsupported causal or statistical-significance claims. The browser shows the current check in the activity bubble and saves each attempt under **查看执行记录 → 校验结果** and in the downloadable JSON. A failed check can route back to the analyst once within the tool budget. Rejected charts are excluded from the answer. Other statistical tools can show partial coverage while independent recalculation is pending.
+
 Tool modules live under `src/tools/`. `dataset.py` defines the shared data context, `inspection.py` shows rows and schema, `preprocessing.py` handles preparation, `charts.py` builds charts, `relationships.py` handles association analysis, and `importance.py` produces predictive importance reports.
 
 Run tests without making LLM API calls:
@@ -105,7 +107,7 @@ python -m pytest -q
 
 ## Backlog
 
-1. Validate the scope and wording of conclusions against structured results. Independently recompute selected statistics and use the outcome to route bounded recovery.
+1. Extend independent recalculation to relationship rankings, trends, and feature importance. Expand scope checks beyond explicit field equality and compare stated numerical claims with structured results.
 2. Review the suitability of analysis candidates before ranking, including numeric identifiers, constant columns, missing values, and usable sample sizes.
 3. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model, and compare the results.
 4. Add regression cases for scope selection, numerical accuracy, and conclusions that overstate the evidence.

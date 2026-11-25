@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from httpx import RequestError, Timeout, TimeoutException
 import pandas as pd
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import RemoveMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -40,6 +41,7 @@ from src.tools import (
     trend_report,
     working_frame,
 )
+from src.validation import NUMERIC_TOOLS, analysis_scope, validate_results
 
 load_dotenv()
 
@@ -137,6 +139,17 @@ class AnalysisInput(MessagesState):
 class AnalysisState(AnalysisInput):
     tool_turns: int
     preview_language: str
+    validation: list[dict]
+    rejected_tool_calls: list[str]
+    recovery_start: int
+
+
+def messages_for_model(messages, rejected=()):
+    return [
+        message.model_copy(update={"content": "Validation excluded this result. Recalculate it before use.", "artifact": None, "status": "error"})
+        if isinstance(message, ToolMessage) and message.tool_call_id in rejected else message
+        for message in messages
+    ]
 
 
 def preview_request_language(text: str) -> str:
@@ -216,7 +229,11 @@ def build_analysis_graph(model, context: AnalysisContext):
                     content="A preparation step failed in this question. Resolve the failed step before analyzing data.",
                     name=call["name"], tool_call_id=call["id"], status="error",
                 )
-        return execute(request)
+        result = execute(request)
+        if call["name"] in NUMERIC_TOOLS and isinstance(result, ToolMessage) and result.status == "success":
+            scope = analysis_scope(working_frame(context, request.state), request.state.get("prepared"))
+            result = result.model_copy(update={"artifact": {**(result.artifact or {}), "analysis_scope": scope}})
+        return result
 
     def entry(state: AnalysisState):
         messages = state["messages"]
@@ -256,12 +273,55 @@ def build_analysis_graph(model, context: AnalysisContext):
         if prepared := state.get("prepared"):
             details = "\n".join(step["detail"] for step in prepared.steps[-8:])
             prompt += f"\nRecent active preparation steps:\n{details}"
+        if validation := state.get("validation"):
+            failures = [item for item in validation[-1]["checks"] if item["status"] == "failed"]
+            feedback = "\n".join(f"- {item['tool']} {item['label']}: {item['detail']}" for item in failures)
+            if feedback:
+                prompt += (
+                    f"\nValidation rejected the previous draft. Fix these findings now:\n{feedback}\n"
+                    "Redo any rejected tool results with corrected data or arguments. For wording alone, correct the reply. "
+                    "Never rely on rejected values. This is the only validation retry."
+                )
         active_model = model_with_tools
         if turns >= MAX_TOOL_TURNS:
             active_model = model
             prompt += "\nThe tool-call budget is exhausted. Summarize completed work and label any gaps."
-        response = active_model.invoke([SystemMessage(content=prompt), *state["messages"]])
+        history = messages_for_model(state["messages"], state.get("rejected_tool_calls", []))
+        response = active_model.invoke([SystemMessage(content=prompt), *history])
         return {"messages": [response], "tool_turns": turns + bool(response.tool_calls)}
+
+    def validate(state: AnalysisState, runtime: Runtime[AnalysisContext]):
+        rejected = set(state.get("rejected_tool_calls", []))
+        checks, invalid = validate_results(
+            runtime.context.dataset, state["messages"], tool_parameters, rejected, state.get("recovery_start", 0),
+            lambda stage: runtime.stream_writer({"event": "validation", "stage": stage}),
+        )
+        if not checks:
+            return {}
+        previous = state.get("validation", [])
+        statuses = {item["status"] for item in checks}
+        status = "failed" if "failed" in statuses else "limited" if "limited" in statuses else "passed"
+        retry = status == "failed" and not previous and state.get("tool_turns", 0) < MAX_TOOL_TURNS
+        attempt = {"attempt": len(previous) + 1, "status": status, "retrying": retry, "checks": checks}
+        update = {"validation": [*previous, attempt], "rejected_tool_calls": sorted(rejected | invalid)}
+        if status == "failed":
+            draft = state["messages"][-1]
+            update["messages"] = [RemoveMessage(id=draft.id)]
+            if retry:
+                update["recovery_start"] = len(state["messages"]) - 1
+                runtime.stream_writer({"event": "validation", "stage": "retry"})
+            else:
+                question = next((message.text for message in reversed(state["messages"]) if isinstance(message, HumanMessage)), "")
+                if re.search(r"[\u3400-\u9fff]", question):
+                    answer = "本轮校验未通过，暂时无法给出可靠结论。可以在执行记录的「校验结果」查看具体问题。"
+                else:
+                    answer = "This analysis did not pass validation. The execution record lists the findings."
+                update["messages"].append(AIMessage(content=answer))
+        return update
+
+    def after_validation(state: AnalysisState):
+        attempts = state.get("validation", [])
+        return "analyst" if attempts and attempts[-1]["retrying"] else END
 
     graph = (
         StateGraph(AnalysisState, context_schema=AnalysisContext, input_schema=AnalysisInput)
@@ -269,10 +329,12 @@ def build_analysis_graph(model, context: AnalysisContext):
         .add_node("request_preview", request_preview)
         .add_node("tools", ToolNode(ANALYSIS_TOOLS, handle_tool_errors=True, wrap_tool_call=guard_preparation))
         .add_node("preview_answer", preview_answer)
+        .add_node("validate", validate)
         .add_conditional_edges(START, entry, ["request_preview", "analyst"])
         .add_edge("request_preview", "tools")
-        .add_conditional_edges("analyst", tools_condition, {"tools": "tools", END: END})
+        .add_conditional_edges("analyst", tools_condition, {"tools": "tools", END: "validate"})
         .add_conditional_edges("tools", after_tools, ["preview_answer", "analyst"])
+        .add_conditional_edges("validate", after_validation, ["analyst", END])
         .add_edge("preview_answer", END)
     )
     return graph.compile().bind(context=context)
@@ -282,7 +344,11 @@ def print_answer(agent, question: str, prepared: PreparedDataset | None = None) 
     result = agent.invoke({"messages": [{"role": "user", "content": question}], "prepared": prepared})
     messages = result["messages"]
     print(f"\nAnswer:\n{messages[-1].text}")
-    for artifact in tool_artifacts(messages):
+    for attempt in result.get("validation", []):
+        print(f"\nValidation {attempt['attempt']} — {attempt['status']}")
+        for item in attempt["checks"]:
+            print(f"{item['label']} · {item['status']} · {item['detail']}")
+    for artifact in tool_artifacts(messages, result.get("rejected_tool_calls", [])):
         if "table" in artifact:
             table = pd.DataFrame(**artifact["table"])
             print(f"\nData preview ({len(table)} of {artifact['total_rows']} rows)\n{table.to_string(index=False)}")
@@ -291,9 +357,10 @@ def print_answer(agent, question: str, prepared: PreparedDataset | None = None) 
     return result.get("prepared")
 
 
-def tool_artifacts(messages):
+def tool_artifacts(messages, rejected=()):
     for message in messages:
-        if isinstance(message, ToolMessage) and message.status == "success" and message.artifact:
+        if (isinstance(message, ToolMessage) and message.status == "success" and message.artifact
+                and message.tool_call_id not in rejected):
             yield message.artifact
 
 
@@ -308,7 +375,7 @@ def tool_parameters(name: str, arguments: dict) -> dict:
     return arguments
 
 
-def tool_trace(messages) -> list[dict]:
+def tool_trace(messages, rejected=()) -> list[dict]:
     """Record completed tool calls in execution order, including rejected attempts."""
     calls = {}
     steps = []
@@ -334,6 +401,8 @@ def tool_trace(messages) -> list[dict]:
             "round": round_number, "tool": call["name"], "parameters": parameters,
             "status": message.status, "result": message.text,
         }
+        if message.tool_call_id in rejected:
+            step["rejected_by_validation"] = True
         artifact = message.artifact if isinstance(message.artifact, dict) else {}
         if artifact.get("deferred"):
             step["deferred"] = True

@@ -211,7 +211,8 @@
         repeating-linear-gradient(90deg, transparent 0 15px, #7fbdb15c 15px 16px);
 }
 
-.phase-review .desk-screen::after {
+.phase-review .desk-screen::after,
+.phase-validation .desk-screen::after {
     content: "";
     position: absolute;
     inset: 12% 7% auto;

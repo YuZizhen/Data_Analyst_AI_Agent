@@ -10,7 +10,8 @@ from langchain.messages import AIMessage, ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_trace
+from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_artifacts, tool_trace
+from src.tools import charts
 
 
 class ScriptedModel:
@@ -214,7 +215,7 @@ def test_filter_and_report(tmp_path):
         AIMessage(content="Singapore hardware averages 20."),
     ])
     agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
-    result = agent.invoke({"messages": [{"role": "user", "content": "Compare item prices only in Singapore."}]})
+    result = agent.invoke({"messages": [{"role": "user", "content": "只看 market = Singapore，再按 category 比较 unit_price 的均值。"}]})
     report = tool_trace(result["messages"])
     deferred = next(step for step in report if "Deferred" in step["result"])
     assert deferred["status"] == "error" and deferred["deferred"]
@@ -226,6 +227,83 @@ def test_filter_and_report(tmp_path):
     assert len(list(tmp_path.glob("*.png"))) == 1
     assert result["prepared"].frame["unit_price"].tolist() == [10, 30]
     assert "1000" in csv.read_text(encoding="utf-8")
+    attempt, = result["validation"]
+    assert attempt["status"] == "passed" and not attempt["retrying"]
+    assert any("有 2 行满足" in check["detail"] for check in attempt["checks"])
+    assert any("hardware 20" in check["detail"] for check in attempt["checks"])
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_validation_rejects_chart_for_wrong_scope_and_retries_once(tmp_path, recover):
+    csv = tmp_path / "products.csv"
+    csv.write_text("market,category,unit_price\nSingapore,hardware,10\nSingapore,hardware,30\nMalaysia,hardware,1000\n", encoding="utf-8")
+    selection = call_tool("filter_rows", "select", column_name="market", operator="equals", value="Singapore")
+    first = call_tool("group_report", "wrong", group_column="category", value_column="unit_price")
+    revised = call_tool("group_report", "corrected", group_column="category", value_column="unit_price")
+    model = ScriptedModel([
+        first, AIMessage(content="均价是 346.67。"),
+        *([selection, revised] if recover else []), AIMessage(content="均价是 20。"),
+    ])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    events = list(graph.stream(
+        {"messages": [{"role": "user", "content": "只看 market = Singapore，按 category 画 unit_price 的均价图。"}]},
+        stream_mode=["values", "custom"],
+    ))
+    stages = [event["stage"] for mode, event in events if mode == "custom"]
+    assert stages == ["scope", "numbers", "conclusion", "retry", "scope", "numbers", "conclusion"]
+    result = next(event for mode, event in reversed(events) if mode == "values")
+    initial, final = result["validation"]
+    assert initial["status"] == "failed" and initial["retrying"]
+    assert any("3 行中，有 2 行" in check["detail"] for check in initial["checks"])
+    assert final["status"] == ("passed" if recover else "failed") and not final["retrying"]
+    assert result["rejected_tool_calls"] == ["wrong"]
+    assert all(message.text != "均价是 346.67。" for message in result["messages"])
+    assert "Validation excluded this result" in next(msg.text for msg in model.last_messages if isinstance(msg, ToolMessage))
+    assert "Validation rejected the previous draft" in model.prompts[-1]
+    artifacts = list(tool_artifacts(result["messages"], result["rejected_tool_calls"]))
+    if recover:
+        report, = (artifact for artifact in artifacts if "path" in artifact)
+        assert report["group_summary"]["groups"] == [{"group": "hardware", "value": 20.0}]
+        assert result["messages"][-1].text == "均价是 20。"
+    else:
+        assert all("path" not in artifact for artifact in artifacts)
+        assert "校验未通过" in result["messages"][-1].text
+
+
+def test_validation_retries_causal_wording_without_recomputing_tool_calls(tmp_path):
+    model = ScriptedModel([
+        call_tool("relationship_report", "pair", x_column="floor_area_sqm", y_column="resale_price"),
+        AIMessage(content="面积显著影响价格。但是这不能证明因果。"),
+        AIMessage(content="面积与价格的 Pearson r 约为 0.110。这不能用来证明面积导致价格变化。"),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [{"role": "user", "content": "画图比较面积与价格。"}]})
+    assert [attempt["status"] for attempt in result["validation"]] == ["failed", "passed"]
+    assert result["validation"][0]["checks"][-1]["label"] == "结论措辞"
+    assert result["rejected_tool_calls"] == []
+    assert any("Pearson r，结果为 +0.110" in check["detail"] for check in result["validation"][-1]["checks"])
+
+
+def test_validation_detects_a_wrong_tool_number(tmp_path, monkeypatch):
+    summarize = charts.summarize_groups
+    wrong_first = iter([True, False])
+
+    def summarize_with_error(groups, values, aggregation):
+        result = summarize(groups, values, aggregation)
+        return result + 100 if next(wrong_first) else result
+
+    monkeypatch.setattr(charts, "summarize_groups", summarize_with_error)
+    model = ScriptedModel([
+        call_tool("average_by_group", "wrong", group_column="town", value_column="resale_price"),
+        AIMessage(content="均值已计算。"),
+        call_tool("average_by_group", "corrected", group_column="town", value_column="resale_price"),
+        AIMessage(content="已重新计算均值。"),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [{"role": "user", "content": "按 town 比较平均转售价。"}]})
+    assert [attempt["status"] for attempt in result["validation"]] == ["failed", "passed"]
+    errors = [check for check in result["validation"][0]["checks"] if check["status"] == "failed"]
+    error, = errors
+    assert error["label"] == "独立复算" and "BISHAN 820,000" in error["detail"]
+    assert result["rejected_tool_calls"] == ["wrong"]
 
 
 def test_clean_and_restore(tmp_path):
