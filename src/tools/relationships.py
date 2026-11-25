@@ -13,7 +13,7 @@ from .dataset import AnalysisContext, CHART_COLOR, column, finite_numbers, numer
 @tool(response_format="content_and_artifact", parse_docstring=True)
 def relationship_report(
     x_column: str, y_column: str, runtime: ToolRuntime[AnalysisContext]
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict]:
     """Plot two specified numeric columns as a PNG scatter chart and calculate Pearson r.
 
     For the strongest relationship with a target across fields, use rank_relationships first.
@@ -32,9 +32,12 @@ def relationship_report(
     x, y = x[valid], y[valid]
     if x.empty:
         raise ToolException("No rows have valid values in both columns.")
-    correlation = "undefined"
+    coefficient = None
     if x.nunique() > 1 and y.nunique() > 1:
-        correlation = f"{x.corr(y):.3f}"
+        r = x.corr(y)
+        if isfinite(r):
+            coefficient = float(r)
+    correlation = "undefined" if coefficient is None else f"{coefficient:.3f}"
     title = f"{y_column} vs. {x_column}"
     subtitle = f"{len(x):,} of {len(df):,} paired rows used | Pearson r = {correlation}"
 
@@ -43,14 +46,15 @@ def relationship_report(
         axes.set(xlabel=x_column, ylabel=y_column)
 
     artifact = render_report(context.output_dir, "relationship", title, subtitle, working_source(context, runtime.state), draw)
+    artifact["pairwise_correlation"] = {"r": coefficient, "paired_rows": len(x), "working_rows": len(df)}
     return f"PNG report created. {title}\n{subtitle}", artifact
 
 
-@tool(parse_docstring=True)
+@tool(response_format="content_and_artifact", parse_docstring=True)
 def rank_relationships(
     target_column: str, runtime: ToolRuntime[AnalysisContext],
     candidate_columns: list[str] | None = None, top_n: int = 10,
-) -> str:
+) -> tuple[str, dict]:
     """Find which fields are most related to a numeric target by comparing them all.
 
     Ranks numeric fields by absolute Pearson r and categorical fields separately by eta.
@@ -128,4 +132,11 @@ def rank_relationships(
     if skipped:
         lines.append("Skipped fields:\n- " + "\n- ".join(skipped))
     lines.append("These are descriptive associations. Compare scores within each ranking. They do not identify causal drivers.")
-    return "\n".join(lines)
+    return "\n".join(lines), {"relationship_ranking": {
+        "rows": len(df), "candidate_count": len(names), "skipped_count": len(skipped),
+        "numeric": [{"field": name, "r": float(r), "rows": size} for name, r, size in numeric[:top_n]],
+        "categorical": [
+            {"field": name, "eta": eta, "rows": size, "groups": group_count}
+            for name, eta, size, group_count in categorical[:top_n]
+        ],
+    }}

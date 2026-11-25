@@ -36,11 +36,11 @@ def metric(
     return numeric_column(df, value_column), f"{AGGREGATION_LABELS[aggregation]} of {value_column}"
 
 
-@tool(parse_docstring=True)
+@tool(response_format="content_and_artifact", parse_docstring=True)
 def average_by_group(
     group_column: str, value_column: str, top_n: int = 10,
     runtime: ToolRuntime[AnalysisContext] = None,
-) -> str:
+) -> tuple[str, dict]:
     """Calculate text-only group averages. For a chart, use group_report instead.
 
     Args:
@@ -49,16 +49,22 @@ def average_by_group(
         top_n: Number of groups to return, between 1 and 25.
     """
     df = working_frame(runtime.context, runtime.state) if runtime else load_dataset()
-    if not 1 <= top_n <= 25:
-        return "top_n must be between 1 and 25."
     try:
+        if not 1 <= top_n <= 25:
+            raise ToolException("top_n must be between 1 and 25.")
         groups = column(df, group_column)
         values = numeric_column(df, value_column)
     except ToolException as error:
-        return str(error)
+        if runtime is not None:
+            raise
+        return str(error), {}
 
-    table = summarize_groups(groups, values, "mean").nlargest(top_n)
-    return "Average by group (descending):\n" + table.to_string()
+    ranked = summarize_groups(groups, values, "mean")
+    table = ranked.nlargest(top_n)
+    return "Average by group (descending):\n" + table.to_string(), {"group_summary": {
+        "rows_used": int(values.count()), "working_rows": len(df), "group_count": len(ranked),
+        "groups": [{"group": "(Missing)" if pd.isna(name) else str(name), "value": float(value)} for name, value in table.items()],
+    }}
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
@@ -68,7 +74,7 @@ def group_report(
     value_column: str | None = None,
     aggregation: Aggregation = "mean",
     top_n: int = 10,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict]:
     """Compare categories or rank groups as a horizontal bar chart in a PNG report.
 
     Args:
@@ -104,6 +110,10 @@ def group_report(
         context.output_dir, "group", title, subtitle, working_source(context, runtime.state), draw,
         height=max(5.2, 2.6 + len(table) * 0.29),
     )
+    artifact["group_summary"] = {
+        "rows_used": int(values.count()), "working_rows": len(df), "group_count": len(ranked),
+        "groups": [{"group": name, "value": float(value)} for name, value in zip(display_labels, table)],
+    }
     return f"PNG report created. {title}\n{subtitle}\n{table.to_string()}", artifact
 
 
@@ -114,7 +124,7 @@ def trend_report(
     value_column: str | None = None,
     aggregation: Aggregation = "mean",
     frequency: Literal["day", "week", "month", "quarter", "year"] = "month",
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict]:
     """Plot a time trend as a PNG line chart using an actual date column.
 
     Args:
@@ -155,6 +165,10 @@ def trend_report(
         axes.set(xlabel=date_column, ylabel=label)
 
     artifact = render_report(context.output_dir, "trend", title, subtitle, working_source(context, runtime.state), draw)
+    artifact["trend_summary"] = {
+        "periods": len(table), "rows_used": int(valid.sum()),
+        "start_period": str(table.index[0]), "end_period": str(table.index[-1]),
+    }
     first = f"First {table.index[0]} = {table.iloc[0]:,.8g}"
     last = f"Last {table.index[-1]} = {table.iloc[-1]:,.8g}"
     low = f"Minimum {table.min():,.8g} in {table.idxmin()}"
@@ -165,7 +179,7 @@ def trend_report(
 @tool(response_format="content_and_artifact", parse_docstring=True)
 def distribution_report(
     value_column: str, runtime: ToolRuntime[AnalysisContext], bins: int = 10
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict]:
     """Plot the frequency distribution of a numeric column as a PNG histogram.
 
     Args:
@@ -189,4 +203,8 @@ def distribution_report(
         axes.grid(False, axis="x")
 
     artifact = render_report(context.output_dir, "distribution", title, subtitle, working_source(context, runtime.state), draw)
+    artifact["distribution_summary"] = {
+        "rows_used": len(values), "working_rows": len(df),
+        "median": float(values.median()), "min": float(values.min()), "max": float(values.max()),
+    }
     return f"PNG report created. {title}\n{subtitle}", artifact

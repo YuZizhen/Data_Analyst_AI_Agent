@@ -87,7 +87,8 @@ data. For a group bar chart use group_report(group_column, value_column, aggrega
 average-price charts. Only use average_by_group when the user explicitly wants text without a chart.
 Each preparation tool must be called alone, before any dependent analysis. The working
 data persists for follow-up questions. Apply missing-value, duplicate or type changes only as
-needed for the user's request, and report their row counts or conversion failures. Use reset_dataset
+needed for the user's request. Explain what each applied step did, why it serves the requested
+analysis, and its actual row counts or conversion failures. Use reset_dataset
 when the user wants the original rows. For an empty selection, check the matching labels in the
 filter tool result. Restore the earlier scope and retry only when the intended label is clear.
 An empty selection must never lead to analysis of the unfiltered original dataset. For comparisons
@@ -99,6 +100,11 @@ let the user inspect it in the interface. For column names or row count alone, u
 If asked for feature importance, top factors and their percentage shares, or a feature importance
 chart, use feature_importance_report and pass the requested top_n. Explain the shares as portions of
 the positive validation error increases, with any remaining positive factors grouped as Other.
+When interpreting whether a feature-importance result holds, reference the working sample size,
+held-out model MAE versus the median baseline, and each cited feature's positive-fold or leading-fold
+count. Explain instability if the winner does not consistently lead. Describe predictive reliance
+on these data and model only. A high share provides no direction of effect or evidence of causation.
+Distinguish checks that actually ran from leakage, time dependence, or generalization that was not checked.
 If the tool reports insufficient data or a failed validation baseline, explain that result. Use
 rank_relationships for descriptive associations if useful, without turning correlations into shares.
 If asked what is most strongly related to a numeric target, call rank_relationships before answering
@@ -306,21 +312,39 @@ def tool_trace(messages) -> list[dict]:
     """Record completed tool calls in execution order, including rejected attempts."""
     calls = {}
     steps = []
+    batch = 0
+    evidence_fields = (
+        "row_change", "overview", "profile", "column_values", "relationship_ranking", "feature_importance",
+        "pairwise_correlation", "group_summary", "trend_summary", "distribution_summary",
+    )
     for message in messages:
-        if isinstance(message, AIMessage):
-            calls.update((call["id"], call) for call in message.tool_calls)
+        if isinstance(message, AIMessage) and message.tool_calls:
+            batch += 1
+            calls.update((call["id"], (batch, call)) for call in message.tool_calls)
         if not isinstance(message, ToolMessage):
             continue
-        call = calls.get(message.tool_call_id)
-        if call is None:
+        request = calls.get(message.tool_call_id)
+        if request is None:
             continue
+        round_number, call = request
         parameters = call["args"]
         if message.status == "success":
             parameters = tool_parameters(call["name"], parameters)
-        steps.append({
-            "tool": call["name"], "parameters": parameters,
+        step = {
+            "round": round_number, "tool": call["name"], "parameters": parameters,
             "status": message.status, "result": message.text,
-        })
+        }
+        artifact = message.artifact if isinstance(message.artifact, dict) else {}
+        if artifact.get("deferred"):
+            step["deferred"] = True
+        evidence = {key: artifact[key] for key in evidence_fields if key in artifact}
+        if "table" in artifact:
+            evidence["preview"] = {"rows": len(artifact["table"]["data"]), "total_rows": artifact["total_rows"]}
+        if "path" in artifact:
+            evidence["png_created"] = True
+        if evidence:
+            step["evidence"] = evidence
+        steps.append(step)
     return steps
 
 

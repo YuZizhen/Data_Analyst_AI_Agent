@@ -2,12 +2,18 @@
 
 from pathlib import Path
 
+import pytest
 from langchain.messages import AIMessage
 from streamlit.testing.v1 import AppTest
 
-from src import agent
+from src import agent, table_store
 from src.web_progress import Activity, activity_for_update, activity_html
 from test_agent import ScriptedModel, call_tool
+
+
+@pytest.fixture(autouse=True)
+def isolated_table_storage(monkeypatch, tmp_path):
+    monkeypatch.setattr(table_store, "DATASET_DIRECTORY", tmp_path / "t")
 
 
 def test_activity_moves_previous_bubbles_into_the_chat_history():
@@ -91,9 +97,28 @@ def test_browser_previews_actual_rows_and_records_tool_response(monkeypatch):
     assert len(trace["dataset"]["sha256"]) == 64
     assert "resale_price" in trace["dataset"]["columns"]
     assert trace["steps"] == [{
-        "tool": "dataset_preview", "parameters": {"limit": 10}, "status": "success",
+        "round": 1, "tool": "dataset_preview", "parameters": {"limit": 10}, "status": "success",
         "result": "Dataset preview ready for display. Showing 6 of 6 rows.",
+        "evidence": {"preview": {"rows": 6, "total_rows": 6}},
     }]
+
+
+def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypatch):
+    model = ScriptedModel([
+        call_tool("rank_relationships", "rank", target_column="resale_price"),
+        AIMessage(content="下面是字段关联排名。"),
+    ])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.chat_input[0].set_value("哪个字段与转售价关联最强？").run()
+    app.run()
+    assert not app.exception
+    assert any("在 6 行中检查了 3 个候选字段" in item.value for item in app.text)
+    assert any("多个候选字段逐一和同一个目标列比较" in item.value for item in app.text)
+    numeric, categorical = [item.value for item in app.dataframe[1:]]
+    assert numeric["Pearson r"].tolist() == ["+0.481", "+0.110"]
+    assert categorical["相关比 η"].tolist() == ["0.954"]
+    assert any("lease_years_remaining: Pearson r = +0.481" in item.value for item in app.code)
 
 
 def test_browser_keeps_prepared_data_until_restored(monkeypatch):
@@ -104,10 +129,15 @@ def test_browser_keeps_prepared_data_until_restored(monkeypatch):
     ])
     monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    original_key = app.selectbox[0].value
     app.chat_input[0].set_value("只保留 Bishan。").run()
     app.run()
     assert not app.exception
+    cleaned_key = app.selectbox[0].value
+    assert cleaned_key != original_key
     assert app.dataframe[0].value["town"].tolist() == ["BISHAN", "BISHAN"]
+    assert any(item.label == "清洗逻辑与代码" for item in app.expander)
+    assert any("filter_frame" in item.value for item in app.code)
     app.chat_input[0].set_value("我可以看一下这份数据吗？").run()
     app.run()
     assert not app.exception
@@ -116,4 +146,10 @@ def test_browser_keeps_prepared_data_until_restored(monkeypatch):
     restore = next(button for button in app.button if button.label == "恢复原始数据")
     restore.click().run()
     assert not app.exception
+    assert app.selectbox[0].value == original_key
     assert len(app.dataframe[0].value) == 6
+
+    fresh = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    fresh.selectbox[0].set_value(cleaned_key).run()
+    assert not fresh.exception
+    assert len(fresh.dataframe[0].value) == 2

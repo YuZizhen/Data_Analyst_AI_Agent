@@ -5,11 +5,11 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
-from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
+import pyarrow as pa
 import streamlit as st
 from langchain.messages import AnyMessage, HumanMessage
 
@@ -22,8 +22,11 @@ from src.agent import (
     tool_artifacts,
     tool_trace,
 )
-from src.tools import DATA_PATH, DEFAULT_PREVIEW_ROWS, AnalysisContext, load_dataset
-from src.web_progress import Activity, activity_for_update, activity_html
+from src import table_store
+from src.table_store import SavedTable, TableStore
+from src.tools import DATA_PATH, DEFAULT_PREVIEW_ROWS, AnalysisContext, PreparedDataset
+from src.web_journey import describe_journey
+from src.web_progress import Activity, activity_for_update, activity_html, describe_call
 
 DEMO_QUESTIONS = {
     "比较各区转售价": "生成各区平均转售价的柱状图，并指出哪个区最高。",
@@ -35,10 +38,10 @@ CONTEXT_TURNS = 4
 
 @dataclass(frozen=True)
 class Dataset:
-    name: str
-    frame: pd.DataFrame | None
-    is_demo: bool
-    checksum: str
+    selected: SavedTable
+    original: SavedTable
+    frame: pd.DataFrame
+    source_frame: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,7 @@ class Report:
     title: str
     filename: str
     image: bytes
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -58,34 +62,43 @@ class Turn:
     activity: list[Activity] = field(default_factory=list)
 
 
-def selected_dataset(upload):
+def select_dataset(store: TableStore) -> Dataset:
+    upload = st.file_uploader("上传 CSV", type="csv")
+    demo = store.save_original(f"{DATA_PATH.name} (synthetic demo)", DATA_PATH.read_bytes(), is_demo=True)
+    pending = st.session_state.pop("select_table_next", None)
     fingerprint = (upload.name, sha256(upload.getbuffer()).hexdigest()) if upload is not None else None
-    cached = st.session_state.get("dataset")
-    if cached is not None and cached[0] == fingerprint and hasattr(cached[1], "checksum"):
-        return cached
+    if fingerprint != st.session_state.get("upload_fingerprint"):
+        st.session_state.upload_fingerprint = fingerprint
+        st.session_state.upload_error = ""
+        if upload is not None:
+            try:
+                pending = store.save_original(upload.name, upload.getvalue()).key
+            except (OSError, ValueError, pa.ArrowException):
+                st.session_state.upload_error = "无法保存上传的表。请检查 CSV 编码、表头和数据行。"
+    if upload_error := st.session_state.get("upload_error"):
+        st.error(upload_error)
 
-    is_demo = upload is None
-    name = f"{DATA_PATH.name} (synthetic demo)" if is_demo else upload.name
-    checksum = ""
-    try:
-        if is_demo:
-            data = DATA_PATH.read_bytes()
-            checksum = sha256(data).hexdigest()
-            frame = load_dataset(BytesIO(data))
-        else:
-            checksum = fingerprint[1]
-            upload.seek(0)
-            frame = load_dataset(upload)
-        if frame.empty:
-            frame = None
-    except (OSError, ValueError):
-        frame = None
-    st.session_state.dataset = (fingerprint, Dataset(name, frame, is_demo, checksum))
-    return st.session_state.dataset
+    entries = store.list()
+    keys = sorted(entries, key=lambda key: (key != demo.key, entries[key].name, bool(entries[key].steps), key))
+    if pending in entries:
+        st.session_state.selected_table = pending
+    if st.session_state.get("selected_table") not in entries:
+        st.session_state.selected_table = demo.key
+    key = st.selectbox("当前使用的数据表", keys, format_func=lambda key: entries[key].label, key="selected_table")
+    cached = st.session_state.get("loaded_table")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    selected = entries[key]
+    original = entries[selected.source_key]
+    source_frame = store.read(original)
+    frame = source_frame if selected.key == original.key else store.read(selected)
+    dataset = Dataset(selected, original, frame, source_frame)
+    st.session_state.loaded_table = (key, dataset)
+    return dataset
 
 
 def analyze(
-    question: str, dataset: Dataset, provider: str, model_name: str, api_key: str,
+    question: str, dataset: Dataset, store: TableStore, provider: str, model_name: str, api_key: str,
     show_activity: Callable[[list[Activity]], None],
 ) -> Turn:
     activity: list[Activity] = []
@@ -95,9 +108,9 @@ def analyze(
         model = build_model(provider, model_name, api_key=api_key.strip())
         recent = [turn for turn in st.session_state.turns if turn.messages][-CONTEXT_TURNS:]
         history = [message for turn in recent for message in turn.messages]
-        prepared_before = st.session_state.get("prepared")
+        prepared_before = PreparedDataset(dataset.frame, dataset.selected.steps) if dataset.selected.steps else None
         with TemporaryDirectory(prefix="analyst-") as directory:
-            context = AnalysisContext(dataset.frame, dataset.name, Path(directory).resolve())
+            context = AnalysisContext(dataset.source_frame, dataset.original.name, Path(directory).resolve())
             graph = build_analysis_graph(model, context)
             inputs = {"messages": [*history, HumanMessage(content=question)], "prepared": prepared_before}
             result = inputs
@@ -114,30 +127,40 @@ def analyze(
             for artifact in tool_artifacts(messages):
                 if "path" in artifact:
                     path = Path(artifact["path"])
-                    reports.append(Report(artifact["title"], path.name, path.read_bytes()))
+                    reports.append(Report(artifact["title"], path.name, path.read_bytes(), artifact.get("feature_importance")))
         steps = tool_trace(messages)
         prepared_after = result.get("prepared")
+        active_after = dataset.original
+        if prepared_after is not None:
+            active_after = store.save_prepared(dataset.original, prepared_after)
+        if active_after.key != dataset.selected.key:
+            st.session_state.select_table_next = active_after.key
+            st.session_state.scope = (active_after.key, provider)
         trace = None
         if steps:
             trace = {
                 "version": 1,
                 "dataset": {
-                    "name": dataset.name,
-                    "sha256": dataset.checksum,
-                    "rows": len(dataset.frame),
-                    "columns": {name: str(dtype) for name, dtype in dataset.frame.dtypes.items()},
+                    "name": dataset.original.name,
+                    "sha256": dataset.original.checksum,
+                    "rows": len(dataset.source_frame),
+                    "columns": {name: str(dtype) for name, dtype in dataset.source_frame.dtypes.items()},
                 },
                 "question": question,
                 "model": {"provider": provider, "name": model_name},
+                "input_table": {"label": dataset.selected.label, "rows": len(dataset.frame), "columns": len(dataset.frame.columns)},
                 "steps": steps,
             }
+            if evidence := [report.evidence for report in reports if report.evidence is not None]:
+                trace["feature_importance"] = evidence
             if prepared_before is not None or prepared_after is not None:
                 trace["working_data"] = {
                     "before": list(prepared_before.steps) if prepared_before is not None else [],
                     "after": list(prepared_after.steps) if prepared_after is not None else [],
-                    "rows_after": len(prepared_after.frame) if prepared_after is not None else len(dataset.frame),
+                    "rows_after": active_after.rows,
+                    "table_before": dataset.selected.key,
+                    "table_after": active_after.key,
                 }
-        st.session_state.prepared = prepared_after
         return Turn(question, messages, reports, trace, activity=activity)
     except MODEL_ERRORS as error:
         if isinstance(error, ConnectionError):
@@ -145,13 +168,94 @@ def analyze(
         return Turn(question, error=model_error_message(error), activity=activity)
     except ValueError as error:
         return Turn(question, error=f"无法启动分析。{error}", activity=activity)
-    except OSError:
-        return Turn(question, error="无法读取生成的图表。请重新发送问题。", activity=activity)
+    except (OSError, pa.ArrowException):
+        return Turn(question, error="无法保存数据表或读取报告。请检查本地工作区。", activity=activity)
 
 
 def show_preview(frame: pd.DataFrame, total_rows: int):
     st.caption(f"显示前 {len(frame):,} 行 · 共 {total_rows:,} 行")
     st.dataframe(frame, hide_index=True, width="stretch")
+
+
+def show_preparation(dataset: Dataset, store: TableStore):
+    entry = dataset.selected
+    with st.expander("清洗逻辑与代码"):
+        st.caption(f"原表 {dataset.original.rows:,} 行 · 当前版本 {entry.rows:,} 行")
+        for index, step in enumerate(entry.steps, start=1):
+            action = describe_call(step["tool"], step["parameters"])
+            st.text(f"{index}. {action.label} · {step['rows_before']:,} → {step['rows_after']:,} 行")
+            st.text("\n".join(action.details))
+            st.caption(step["detail"])
+        script, implementation = store.preparation_code(entry)
+        replay_tab, source_tab = st.tabs(["复现脚本", "实际工具代码"])
+        with replay_tab:
+            st.code(script, language="python")
+        with source_tab:
+            st.code(implementation, language="python")
+        st.download_button(
+            "下载清洗版 CSV", dataset.frame.to_csv(index=False).encode("utf-8-sig"),
+            f"cleaned-{entry.key[:10]}.csv", mime="text/csv", key=f"table-csv-{entry.key}", on_click="ignore",
+        )
+
+
+def show_importance_evidence(evidence: dict):
+    folds = evidence["folds"]
+    with st.expander("因素重要性怎么解读", expanded=True):
+        st.write(
+            f"用 {evidence['rows']:,} 行做 {folds} 折验证。模型平均绝对误差（MAE）为 "
+            f"{evidence['validation_mae']:,.4g}，只猜中位数时为 {evidence['baseline_mae']:,.4g}。"
+            f"模型在 {evidence['baseline_wins']}/{folds} 折中误差更低。"
+        )
+        top = evidence["factors"][0]
+        st.text(
+            f"打乱「{top['field']}」后，验证误差平均增加 {top['mae_increase']:,.4g}。"
+            f"它在 {top['leading_folds']}/{folds} 折中排名第一或并列第一。"
+        )
+        if top["leading_folds"] < folds:
+            st.caption("第一名随验证折变化，具体名次需要更多数据来确认。")
+        for factor in evidence["factors"]:
+            st.text(f"{factor['field']} · 占比 {factor['share']:.1%} · {factor['positive_folds']}/{folds} 折打乱后误差上升")
+        st.caption("占比描述模型在这份数据里的预测依赖。相关字段可能分摊重要性，因果方向和其他数据上的表现需要额外验证。")
+
+
+def show_execution_record(turn: Turn, trace: dict):
+    journey = describe_journey(trace["steps"])
+    with st.expander("查看执行记录"):
+        journey_tab, raw_tab = st.tabs(["分析旅程", "原始工具数据"])
+        with journey_tab:
+            st.markdown("**本轮问题**")
+            st.text(trace["question"])
+            input_table = trace.get("input_table")
+            if input_table:
+                st.text(f"起始数据 · {input_table['label']} · {input_table['columns']:,} 列")
+            else:
+                st.text(f"数据来源 · {trace['dataset']['name']}")
+            if working := trace.get("working_data"):
+                st.caption(f"本轮结束时的工作表有 {working['rows_after']:,} 行。")
+            for number, step in enumerate(journey, start=1):
+                with st.container(border=True):
+                    st.markdown(f"**{number}. {step['action']}**")
+                    round_label = f"第 {step['round']} 轮 · " if step["round"] is not None else ""
+                    st.caption(f"{round_label}{step['status']}")
+                    if step["purpose"]:
+                        st.text(f"用途 · {step['purpose']}")
+                    for detail in step["method"]:
+                        st.text(f"做法 · {detail}")
+                    for note in step["outcome"]:
+                        st.text(note)
+                    for table in step["tables"]:
+                        st.caption(table["title"])
+                        st.dataframe(table["rows"], hide_index=True, width="stretch")
+        with raw_tab:
+            for number, step in enumerate(trace["steps"], start=1):
+                st.text(f"{number}. {step['tool']} · {journey[number - 1]['status']}")
+                st.json(step["parameters"], expanded=False)
+                st.code(step["result"], language=None, wrap_lines=True)
+        st.download_button(
+            "下载执行记录 JSON", json.dumps({**trace, "journey": journey}, ensure_ascii=False, indent=2),
+            "analysis-trace.json", mime="application/json",
+            key=f"trace-{turn.messages[0].id}", on_click="ignore",
+        )
 
 
 def show_turn(turn: Turn):
@@ -171,34 +275,34 @@ def show_turn(turn: Turn):
         for report in turn.reports:
             with st.container(border=True):
                 st.image(report.image, caption=report.title, width="stretch")
+                evidence = getattr(report, "evidence", None)
+                if evidence:
+                    show_importance_evidence(evidence)
                 st.download_button(
                     "下载 PNG", report.image, report.filename, mime="image/png",
                     key=report.filename, on_click="ignore",
                 )
         trace = getattr(turn, "trace", None)
         if trace:
-            with st.expander("查看执行记录"):
-                for step in trace["steps"]:
-                    status = "工具返回错误" if step["status"] == "error" else "工具已返回结果"
-                    st.text(f"{step['tool']} · {status}")
-                    st.json(step["parameters"], expanded=False)
-                    st.text(step["result"])
-                st.download_button(
-                    "下载执行记录 JSON", json.dumps(trace, ensure_ascii=False, indent=2),
-                    "analysis-trace.json", mime="application/json",
-                    key=f"trace-{turn.messages[0].id}", on_click="ignore",
-                )
+            show_execution_record(turn, trace)
 
 
 def main():
     st.set_page_config(page_title="数据分析工作台", page_icon=":material/analytics:", layout="wide")
     st.html(Path(__file__).with_name("web.css"))
 
+    store = TableStore(table_store.DATASET_DIRECTORY)
     with st.sidebar:
         st.subheader("数据源", anchor=False)
-        upload = st.file_uploader("上传 CSV", type="csv")
-        fingerprint, dataset = selected_dataset(upload)
-        data_details = st.container()
+        try:
+            dataset = select_dataset(store)
+        except (OSError, ValueError, pa.ArrowException):
+            st.error("无法读取本地数据表。请检查工作区中的数据文件。")
+            st.stop()
+        st.caption(f"{len(dataset.frame):,} 行 · {len(dataset.frame.columns):,} 列")
+        with st.expander("查看字段"):
+            for column, dtype in dataset.frame.dtypes.items():
+                st.text(f"{column} · {dtype}")
 
         st.divider()
         st.subheader("分析模型", anchor=False)
@@ -216,44 +320,31 @@ def main():
             )
             st.caption("问题、字段信息和工具结果会发送给 OpenAI。")
 
-        scope = (fingerprint, provider)
+        scope = (dataset.selected.key, provider)
         if st.session_state.get("scope") != scope:
             st.session_state.scope = scope
             st.session_state.turns = []
-            st.session_state.prepared = None
         st.divider()
         if st.button("新对话", width="stretch", disabled=not st.session_state.turns):
             st.session_state.turns = []
-            st.session_state.prepared = None
-
-        prepared = st.session_state.get("prepared")
-        with data_details:
-            if dataset.frame is None:
-                st.error("无法读取数据。请上传有表头和数据行的 UTF-8 CSV 文件。")
-            else:
-                st.text("HDB 转售示例（合成数据）" if dataset.is_demo else dataset.name)
-                st.caption(f"{len(dataset.frame):,} 行 · {len(dataset.frame.columns):,} 列")
-                if prepared is not None and st.button("恢复原始数据", width="stretch"):
-                    st.session_state.prepared = prepared = None
-                current_frame = dataset.frame if prepared is None else prepared.frame
-                if prepared is not None:
-                    st.caption(f"当前分析使用 {len(current_frame):,} / {len(dataset.frame):,} 行")
-                with st.expander("查看字段"):
-                    for column, dtype in current_frame.dtypes.items():
-                        st.text(f"{column} · {dtype}")
+        if dataset.selected.steps and st.button("恢复原始数据", width="stretch"):
+            st.session_state.select_table_next = dataset.original.key
+            st.session_state.scope = (dataset.original.key, provider)
+            st.rerun()
 
     st.title("数据分析工作台", anchor=False)
     st.markdown("用自然语言分析 CSV，生成可下载的图表。")
-    if dataset.frame is not None:
-        with st.expander("预览数据"):
-            show_preview(current_frame.head(DEFAULT_PREVIEW_ROWS), len(current_frame))
+    with st.expander("预览数据"):
+        show_preview(dataset.frame.head(DEFAULT_PREVIEW_ROWS), len(dataset.frame))
+    if dataset.selected.steps:
+        show_preparation(dataset, store)
 
     example = None
-    if not st.session_state.turns and dataset.frame is not None:
+    if not st.session_state.turns:
         with st.container(border=True, key="start_here"):
             st.subheader("开始分析", anchor=False)
             st.markdown("选择一个示例，或在下方输入自己的问题。")
-            prompts = DEMO_QUESTIONS if dataset.is_demo else {
+            prompts = DEMO_QUESTIONS if dataset.selected.is_demo and not dataset.selected.steps else {
                 "查看数据行": "我可以看一下这份数据吗？",
                 "检查数据质量": "请检查这份数据的字段类型、缺失值和不同取值数。",
             }
@@ -264,7 +355,7 @@ def main():
     for turn in st.session_state.turns:
         show_turn(turn)
 
-    question = st.chat_input("输入你的分析问题…", disabled=dataset.frame is None) or example
+    question = st.chat_input("输入你的分析问题…") or example
     if question and question.strip():
         question = question.strip()
         with st.chat_message("user", avatar=":material/person:"):
@@ -275,7 +366,7 @@ def main():
             def show_activity(steps):
                 progress_slot.html(activity_html(steps, running=True))
 
-            turn = analyze(question, dataset, provider, model_name, api_key, show_activity)
+            turn = analyze(question, dataset, store, provider, model_name, api_key, show_activity)
         st.session_state.turns.append(turn)
         st.rerun()
 

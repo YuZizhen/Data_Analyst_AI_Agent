@@ -5,11 +5,11 @@ from langchain_core.tools import ToolException
 
 from .dataset import AnalysisContext, DEFAULT_PREVIEW_ROWS, describe_dataset, load_dataset, working_frame
 
-@tool
-def dataset_overview(runtime: ToolRuntime[AnalysisContext] = None) -> str:
+@tool(response_format="content_and_artifact")
+def dataset_overview(runtime: ToolRuntime[AnalysisContext] = None) -> tuple[str, dict]:
     """Show the available dataset columns, their types, and the row count."""
     df = working_frame(runtime.context, runtime.state) if runtime else load_dataset()
-    return describe_dataset(df)
+    return describe_dataset(df), {"overview": {"rows": len(df), "columns": len(df.columns)}}
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)

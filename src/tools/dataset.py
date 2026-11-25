@@ -39,7 +39,7 @@ def working_source(context: AnalysisContext, state: dict) -> str:
 
 def load_dataset(path: Path | BinaryIO = DATA_PATH) -> pd.DataFrame:
     """Load a CSV, defaulting to the repository's demonstration dataset."""
-    return pd.read_csv(path)
+    return pd.read_csv(path, low_memory=False)
 
 
 def describe_dataset(df: pd.DataFrame) -> str:

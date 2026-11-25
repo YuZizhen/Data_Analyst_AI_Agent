@@ -177,6 +177,11 @@ def test_top_factor_chart(tmp_path):
     assert "3-fold validation | 240 rows" in step["result"]
     assert "- volume:" in step["result"] and "Other factors (2)" in step["result"]
     assert "Skipped: constant" in step["result"]
+    tool_message = next(message for message in result["messages"] if isinstance(message, ToolMessage))
+    evidence = tool_message.artifact["feature_importance"]
+    assert evidence["baseline_wins"] == 3
+    assert evidence["factors"][0]["positive_folds"] == 3
+    assert evidence["factors"][0]["leading_folds"] == 3
     percentages = re.findall(r"(\d+\.\d)%", step["result"])
     assert len(percentages) == 2 and sum(map(float, percentages)) == pytest.approx(100.0, abs=0.1)
     png, = tmp_path.glob("importance-*.png")
@@ -211,7 +216,11 @@ def test_filter_and_report(tmp_path):
     agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
     result = agent.invoke({"messages": [{"role": "user", "content": "Compare item prices only in Singapore."}]})
     report = tool_trace(result["messages"])
-    assert next(step for step in report if "Deferred" in step["result"])["status"] == "error"
+    deferred = next(step for step in report if "Deferred" in step["result"])
+    assert deferred["status"] == "error" and deferred["deferred"]
+    filter_step = next(step for step in report if step["tool"] == "filter_rows")
+    assert filter_step["round"] == deferred["round"] == 1
+    assert filter_step["evidence"]["row_change"] == {"before": 3, "after": 2}
     completed = [step for step in report if step["tool"] == "group_report" and step["status"] == "success"]
     assert len(completed) == 1 and "20.0" in completed[0]["result"]
     assert len(list(tmp_path.glob("*.png"))) == 1

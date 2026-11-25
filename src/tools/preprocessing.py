@@ -43,12 +43,13 @@ def save_preparation(
     message = ToolMessage(
         content=f"{detail} Working rows: {before:,} → {len(frame):,} of {len(runtime.context.dataset):,} original rows.",
         name=name, tool_call_id=runtime.tool_call_id,
+        artifact={"row_change": {"before": before, "after": len(frame)}},
     )
     return Command(update={"prepared": PreparedDataset(frame, (*steps, record)), "messages": [message]})
 
 
-@tool(parse_docstring=True)
-def profile_dataset(runtime: ToolRuntime[AnalysisContext], columns: list[str] | None = None) -> str:
+@tool(response_format="content_and_artifact", parse_docstring=True)
+def profile_dataset(runtime: ToolRuntime[AnalysisContext], columns: list[str] | None = None) -> tuple[str, dict]:
     """Check data types, missing values and distinct values before cleaning the working dataset.
 
     Args:
@@ -57,15 +58,19 @@ def profile_dataset(runtime: ToolRuntime[AnalysisContext], columns: list[str] | 
     frame = working_frame(runtime.context, runtime.state)
     fields = list(frame.columns[:25]) if columns is None else selected_columns(frame, columns)
     lines = [f"Working dataset: {len(frame):,} rows, {len(frame.columns):,} columns. Profiling {len(fields)} columns."]
+    results = []
     for name in fields:
         values = frame[name]
         missing = missing_mask(values)
-        lines.append(f"- {name}: {values.dtype}, {missing.sum():,} missing or blank, {values[~missing].nunique():,} distinct")
-    return "\n".join(lines)
+        missing_count = int(missing.sum())
+        distinct_count = int(values[~missing].nunique())
+        lines.append(f"- {name}: {values.dtype}, {missing_count:,} missing or blank, {distinct_count:,} distinct")
+        results.append({"field": name, "dtype": str(values.dtype), "missing": missing_count, "distinct": distinct_count})
+    return "\n".join(lines), {"profile": {"rows": len(frame), "fields": results}}
 
 
-@tool(parse_docstring=True)
-def inspect_column_values(column_name: str, runtime: ToolRuntime[AnalysisContext], limit: int = 10) -> str:
+@tool(response_format="content_and_artifact", parse_docstring=True)
+def inspect_column_values(column_name: str, runtime: ToolRuntime[AnalysisContext], limit: int = 10) -> tuple[str, dict]:
     """List frequent values in a column to find exact labels such as countries or product categories.
 
     Args:
@@ -80,23 +85,14 @@ def inspect_column_values(column_name: str, runtime: ToolRuntime[AnalysisContext
     counts = values[~missing].value_counts()
     lines = [f"{column_name}: {len(counts):,} distinct nonblank values; {missing.sum():,} missing or blank."]
     lines.extend(f"- {value!r}: {count:,} rows" for value, count in counts.head(limit).items())
-    return "\n".join(lines)
+    return "\n".join(lines), {"column_values": {
+        "distinct": len(counts), "missing": int(missing.sum()),
+        "values": [{"label": str(value), "rows": int(count)} for value, count in counts.head(limit).items()],
+    }}
 
 
-@tool(parse_docstring=True)
-def filter_rows(column_name: str, operator: FilterOperator, value: Scalar | list[Scalar],
-                runtime: ToolRuntime[AnalysisContext]) -> Command:
-    """Keep working rows that match a user-requested condition, before later analysis calls.
-
-    Text matching ignores case and surrounding whitespace. Ordered comparisons use numbers
-    or a datetime column. Missing values are excluded. Repeated filters narrow the current table.
-
-    Args:
-        column_name: Exact CSV column to filter, for example a country or category column.
-        operator: equals, not_equals, in (one of a list), contains (literal text), or an ordered comparison.
-        value: A single comparison value, or a nonempty list for the in operator.
-    """
-    frame = working_frame(runtime.context, runtime.state)
+def filter_frame(frame: pd.DataFrame, column_name: str, operator: FilterOperator,
+                 value: Scalar | list[Scalar]) -> pd.DataFrame:
     values = column(frame, column_name)
     if operator == "in" and (not isinstance(value, list) or not value):
         raise ToolException("The in operator needs a nonempty list of values.")
@@ -129,7 +125,24 @@ def filter_rows(column_name: str, operator: FilterOperator, value: Scalar | list
             matched = values.isin(operands)
             if operator == "not_equals":
                 matched = ~matched
-    result = frame.loc[(valid & matched).fillna(False)].copy()
+    return frame.loc[(valid & matched).fillna(False)].copy()
+
+
+@tool(parse_docstring=True)
+def filter_rows(column_name: str, operator: FilterOperator, value: Scalar | list[Scalar],
+                runtime: ToolRuntime[AnalysisContext]) -> Command:
+    """Keep working rows that match a user-requested condition, before later analysis calls.
+
+    Text matching ignores case and surrounding whitespace. Ordered comparisons use numbers
+    or a datetime column. Missing values are excluded. Repeated filters narrow the current table.
+
+    Args:
+        column_name: Exact CSV column to filter, for example a country or category column.
+        operator: equals, not_equals, in (one of a list), contains (literal text), or an ordered comparison.
+        value: A single comparison value, or a nonempty list for the in operator.
+    """
+    frame = working_frame(runtime.context, runtime.state)
+    result = filter_frame(frame, column_name, operator, value)
     detail = f"Applied filter {column_name} {operator} {value!r}."
     if result.empty and not frame.empty:
         labels = column(frame, column_name)
@@ -142,6 +155,13 @@ def filter_rows(column_name: str, operator: FilterOperator, value: Scalar | list
     return save_preparation(runtime, result, "filter_rows", parameters, detail)
 
 
+def drop_missing_frame(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    usable = pd.Series(True, index=frame.index)
+    for name in selected_columns(frame, columns):
+        usable &= ~missing_mask(frame[name])
+    return frame.loc[usable].copy()
+
+
 @tool(parse_docstring=True)
 def drop_missing(columns: list[str], runtime: ToolRuntime[AnalysisContext]) -> Command:
     """Remove working rows with null or blank values in any of the specified columns.
@@ -151,12 +171,14 @@ def drop_missing(columns: list[str], runtime: ToolRuntime[AnalysisContext]) -> C
     """
     frame = working_frame(runtime.context, runtime.state)
     fields = selected_columns(frame, columns)
-    usable = pd.Series(True, index=frame.index)
-    for name in fields:
-        usable &= ~missing_mask(frame[name])
-    result = frame.loc[usable].copy()
+    result = drop_missing_frame(frame, fields)
     detail = f"Removed {len(frame) - len(result):,} rows missing a value in {', '.join(fields)}."
     return save_preparation(runtime, result, "drop_missing", {"columns": fields}, detail)
+
+
+def drop_duplicate_frame(frame: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
+    fields = None if columns is None else selected_columns(frame, columns)
+    return frame.drop_duplicates(subset=fields)
 
 
 @tool(parse_docstring=True)
@@ -168,9 +190,25 @@ def drop_duplicates(runtime: ToolRuntime[AnalysisContext], columns: list[str] | 
     """
     frame = working_frame(runtime.context, runtime.state)
     fields = None if columns is None else selected_columns(frame, columns)
-    result = frame.drop_duplicates(subset=fields)
+    result = drop_duplicate_frame(frame, fields)
     detail = f"Removed {len(frame) - len(result):,} duplicate rows using {', '.join(fields) if fields else 'all columns'}."
     return save_preparation(runtime, result, "drop_duplicates", {"columns": fields}, detail)
+
+
+def convert_frame_column(frame: pd.DataFrame, column_name: str, data_type: Literal["number", "date", "text"],
+                         date_format: str | None = None) -> pd.DataFrame:
+    original = column(frame, column_name)
+    missing = missing_mask(original)
+    if data_type == "number":
+        converted = finite_numbers(original)
+    elif data_type == "date":
+        converted = pd.to_datetime(original.astype("string"), format=date_format or "ISO8601", errors="coerce", utc=True)
+    else:
+        converted = original.astype("string").str.strip()
+    converted = converted.mask(missing)
+    if data_type != "text" and (~missing).any() and not converted.notna().any():
+        raise ToolException("No values could be converted. Check the requested type or date format.")
+    return frame.assign(**{column_name: converted})
 
 
 @tool(parse_docstring=True)
@@ -184,21 +222,11 @@ def convert_column(column_name: str, data_type: Literal["number", "date", "text"
         date_format: Optional strptime date format such as %d/%m/%Y. Default is ISO-8601.
     """
     frame = working_frame(runtime.context, runtime.state)
-    original = column(frame, column_name)
-    missing = missing_mask(original)
-    if data_type == "number":
-        converted = finite_numbers(original)
-    elif data_type == "date":
-        converted = pd.to_datetime(original.astype("string"), format=date_format or "ISO8601", errors="coerce", utc=True)
-    else:
-        converted = original.astype("string").str.strip()
-    converted = converted.mask(missing)
-    newly_missing = int((converted.isna() & ~missing).sum())
-    if data_type != "text" and (~missing).any() and not converted.notna().any():
-        raise ToolException("No values could be converted. Check the requested type or date format.")
+    result = convert_frame_column(frame, column_name, data_type, date_format)
+    newly_missing = int((result[column_name].isna() & ~missing_mask(frame[column_name])).sum())
     detail = f"Converted {column_name} to {data_type}; {newly_missing:,} nonblank values could not be parsed."
     params = {"column_name": column_name, "data_type": data_type, "date_format": date_format}
-    return save_preparation(runtime, frame.assign(**{column_name: converted}), "convert_column", params, detail)
+    return save_preparation(runtime, result, "convert_column", params, detail)
 
 
 @tool
@@ -207,8 +235,17 @@ def reset_dataset(runtime: ToolRuntime[AnalysisContext]) -> Command:
     message = ToolMessage(
         content=f"Original dataset restored: {len(runtime.context.dataset):,} rows. All working transformations cleared.",
         name="reset_dataset", tool_call_id=runtime.tool_call_id,
+        artifact={"row_change": {
+            "before": len(working_frame(runtime.context, runtime.state)), "after": len(runtime.context.dataset),
+        }},
     )
     return Command(update={"prepared": None, "messages": [message]})
 
 
 PREPARATION_TOOLS = (filter_rows, drop_missing, drop_duplicates, convert_column, reset_dataset)
+PREPARATION_FUNCTIONS = {
+    "filter_rows": filter_frame,
+    "drop_missing": drop_missing_frame,
+    "drop_duplicates": drop_duplicate_frame,
+    "convert_column": convert_frame_column,
+}

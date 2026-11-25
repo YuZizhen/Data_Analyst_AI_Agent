@@ -39,9 +39,13 @@ Open `http://127.0.0.1:8501`. The sidebar lets you upload a CSV, inspect its fie
 
 Open **预览数据** above the chat to inspect the first ten rows without asking a model. You can also ask to see the current dataset in the chat. **查看执行记录** below a tool-backed reply shows the tools that returned results or errors and offers a JSON download.
 
+The execution record opens to **分析旅程**, which explains the purpose, parameters, and recorded results of each tool step in Chinese. The **原始工具数据** tab preserves the exact tool parameters and outputs. Both views come from the recorded calls and are included in the JSON download.
+
 While an answer is running, an animated analyst types at a workstation and the current action appears in a thought bubble. Each bubble describes the selected analysis, including its fields and parameters. Meaningful steps move into the conversation history, while the initial waiting cue disappears. Browser reduced-motion preferences disable the animations.
 
-The latest four completed exchanges are available for follow-up questions. Preparations apply to a working copy within the conversation. The sidebar shows how many rows are active, and **恢复原始数据** clears the preparation. Changing the dataset or model provider starts a new conversation. Browser conversations and generated reports are kept in the session. Download any images you want to keep.
+The sidebar's **当前使用的数据表** selector lists uploaded originals and saved cleaned versions. Successful preparation creates or reuses a version and selects it for follow-up questions. The originals and versions are stored locally as Parquet under `data/private/datasets/`, which is excluded from Git. Manual table or model-provider changes start a new conversation. The **恢复原始数据** button selects the original table. The last four exchanges provide chat context within a conversation.
+
+For a cleaned version, open **清洗逻辑与代码** to see each operation, its parameters and row counts, a replay script for the saved original, the actual Python implementations, and a CSV download. Run the replay script from the project environment. It writes a separate output file.
 
 ### Command-line interface
 
@@ -85,7 +89,7 @@ Tools can also profile the data, inspect common values, drop rows missing select
 
 Ask for the top N factors predicting a numeric column and their shares. The tool trains a random forest with three shuffled validation folds, shuffles each original factor independently, and measures the change in mean absolute error (MAE). The share divides each positive mean increase by the total across all positive factors. The chart shows the top N and groups the remaining positive shares under **Other factors**. Shares describe how this model uses the supplied data. Correlated factors can split or mask importance. Use only candidate fields available when making the prediction.
 
-The tool needs at least 30 working rows with valid targets and checks that validation MAE beats a median baseline. The six-row HDB demo supports descriptive relationship rankings. It is too small for a predictive importance report.
+The tool needs at least 30 working rows with valid targets and checks that validation MAE beats a median baseline. The six-row HDB demo supports descriptive relationship rankings. It is too small for a predictive importance report. The browser's evidence panel and the model's explanation use the held-out MAE comparison and per-fold stability counts. These counts describe this validation setup, and further checks are needed to establish causation or performance on other data.
 
 ## How it works
 

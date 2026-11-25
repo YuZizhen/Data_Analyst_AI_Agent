@@ -3,6 +3,7 @@ langgraph>=1.0,<2.0
 langchain-openai
 langchain-ollama>=1.2,<2
 pandas>=2.0
+pyarrow>=14
 matplotlib>=3.8
 scikit-learn>=1.4.2,<2
 python-dotenv

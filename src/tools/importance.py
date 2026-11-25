@@ -55,7 +55,7 @@ def prepare_features(frame: pd.DataFrame, fields: dict) -> tuple[pd.DataFrame, l
 
 def validation_importance(
     features: pd.DataFrame, target: pd.Series, numeric: list[str], categorical: list[str],
-) -> tuple[pd.Series, float, float]:
+) -> tuple[pd.Series, pd.DataFrame, float, float, int]:
     preprocess = ColumnTransformer([
         ("numeric", SimpleImputer(strategy="median", keep_empty_features=True), numeric),
         ("categorical", OneHotEncoder(handle_unknown="ignore", min_frequency=2), categorical),
@@ -89,14 +89,16 @@ def validation_importance(
         for x, y, _, _, fitted in validation
     ]
     values = pd.Series(np.average(increases, axis=0, weights=weights), index=features.columns)
-    return values, model_mae, baseline_mae
+    fold_scores = pd.DataFrame(increases, columns=features.columns)
+    baseline_wins = sum(mae < baseline for _, _, mae, baseline, _ in validation)
+    return values, fold_scores, model_mae, baseline_mae, baseline_wins
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
 def feature_importance_report(
     target_column: str, runtime: ToolRuntime[AnalysisContext], top_n: int = 5,
     candidate_columns: list[str] | None = None,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict]:
     """Make a Top N predictive feature importance chart with percentage shares for a numeric target.
 
     Uses a validation-based regression model and permutation importance. Use for requests like
@@ -125,7 +127,9 @@ def feature_importance_report(
     if not len(features.columns):
         raise ToolException("No eligible candidate factors in the working data. Check the candidate columns and their values.")
 
-    raw, model_mae, baseline_mae = validation_importance(features, target, numeric, categorical)
+    raw, fold_scores, model_mae, baseline_mae, baseline_wins = validation_importance(
+        features, target, numeric, categorical,
+    )
     positive = raw[raw > 0].sort_values(ascending=False, kind="stable")
     if positive.empty:
         raise ToolException("No factor increased mean absolute error when shuffled, so there is no positive total to divide.")
@@ -157,12 +161,38 @@ def feature_importance_report(
         context.output_dir, "importance", title, subtitle, working_source(context, runtime.state), draw,
         height=max(5.2, 2.8 + 0.31 * len(labels)),
     )
+    fold_maxima = fold_scores.max(axis=1)
+    factors = [
+        {
+            "field": field,
+            "share": float(share),
+            "mae_increase": float(positive[field]),
+            "positive_folds": int((fold_scores[field] > 0).sum()),
+            "leading_folds": int(((fold_scores[field] == fold_maxima) & (fold_scores[field] > 0)).sum()),
+        }
+        for field, share in shown.items()
+    ]
+    artifact["feature_importance"] = {
+        "target": target_column, "rows": len(target), "folds": VALIDATION_FOLDS,
+        "validation_mae": model_mae, "baseline_mae": baseline_mae, "baseline_wins": baseline_wins,
+        "factors": factors,
+    }
     lines = [f"PNG report created. {title}", subtitle]
-    lines.extend(f"- {field}: {share:.1%} | validation MAE increase {positive[field]:+.5g}" for field, share in shown.items())
+    lines.append(f"The model beat the median baseline in {baseline_wins}/{VALIDATION_FOLDS} validation folds.")
+    for factor in factors:
+        lines.append(
+            f"- {factor['field']}: {factor['share']:.1%} | validation MAE increase {factor['mae_increase']:+.5g}"
+            f" | positive in {factor['positive_folds']}/{VALIDATION_FOLDS} folds"
+            f" | tied for or ranked first in {factor['leading_folds']}/{VALIDATION_FOLDS} folds"
+        )
     if not other.empty:
         lines.append(f"- Other factors ({len(other)}): {other.sum():.1%}")
     lines.append(f"Evaluated {len(raw)} factors. {len(raw) - len(positive)} had zero or negative mean MAE increase.")
     if skipped:
         lines.append("Skipped: " + ", ".join(skipped) + ".")
-    lines.append("Shares divide each positive increase by the sum across all positive factors. This measures model reliance during validation.")
+    lines.append(
+        "Shares divide each positive increase by the sum across all positive factors. "
+        "Fold counts are descriptive stability checks. This measures model reliance during validation. "
+        "Correlated factors can share importance. Target leakage and generalization to other datasets were not tested."
+    )
     return "\n".join(lines), artifact
