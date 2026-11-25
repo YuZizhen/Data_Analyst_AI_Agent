@@ -6,6 +6,7 @@ from html import escape
 from langchain.messages import AIMessage
 
 from src.agent import first_preparation_call, tool_parameters
+from src.tools.candidates import CANDIDATE_TOOLS
 
 
 @dataclass(frozen=True)
@@ -92,8 +93,8 @@ def describe_call(name: str, args: dict) -> Activity | None:
         case "rank_relationships":
             target = field_label(params.get("target_column"))
             candidates = params.get("candidate_columns")
-            fields = "、".join(map(field_label, candidates)) if candidates else "其余字段"
-            detail = f"逐列比较{fields}与{target}的关联。数值列按 |Pearson r| 排名，分类列单独计算 η。"
+            fields = f"入选的 {len(candidates)} 个字段" if candidates is not None else "符合条件的字段"
+            detail = f"比较{fields}与{target}的关联。数值列按 |Pearson r| 排名，分类列单独计算 η。"
             return Activity("比较字段关联强度", details=(detail,))
         case "feature_importance_report":
             target = field_label(params.get("target_column"))
@@ -118,7 +119,7 @@ def activity_for_update(update):
             calls = [preparation] if preparation is not None else message.tool_calls
             actions = tuple(dict.fromkeys(
                 action for call in calls
-                if (action := describe_call(call["name"], call["args"])) is not None
+                if call["name"] not in CANDIDATE_TOOLS and (action := describe_call(call["name"], call["args"])) is not None
             ))
             if len(actions) == 1:
                 yield actions[0]
@@ -126,6 +127,27 @@ def activity_for_update(update):
                 phase = "chart" if any(action.phase == "chart" for action in actions) else "review"
                 details = tuple(f"{action.label}。{action.details[0]}" for action in actions)
                 yield Activity(f"同时执行 {len(actions)} 项分析", phase, details)
+
+
+def update_candidate_activity(activity: list[Activity], event: dict) -> bool:
+    if event.get("event") == "candidate_calculation":
+        activity.append(describe_call(event["tool"], event["args"]))
+        return True
+    if event.get("event") != "candidate_review":
+        return False
+    target = field_label(event["target"])
+    label = "正在审查候选字段"
+    scope = f"为目标{target}检查有效样本、取值变化和字段用途。"
+    if event["stage"] == "start":
+        activity.append(Activity(label, details=(scope,)))
+    else:
+        counts = event["counts"]
+        summary = f"入选 {counts['included']} 个，跳过 {counts['excluded']} 个，待确认 {counts['needs_confirmation']} 个。"
+        for index in range(len(activity) - 1, -1, -1):
+            if activity[index] == Activity(label, details=(scope,)):
+                activity[index] = Activity(label, details=(scope, summary))
+                break
+    return True
 
 
 VALIDATION_ACTIVITIES = {

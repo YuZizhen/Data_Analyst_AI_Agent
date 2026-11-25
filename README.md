@@ -15,7 +15,7 @@ A self-validating data analysis agent built with **LangChain**, **LangGraph**, *
 - Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
-- Compare all candidate fields against a numeric target by ranking numeric Pearson correlations and categorical correlation ratios separately, with paired sample sizes.
+- Review eligible fields against a numeric target, then rank Pearson correlations for numeric fields and correlation ratios for categorical fields separately, with paired sample sizes.
 - Plot the top N predictive factors for a numeric target with percentage shares and an Other factors bar when needed.
 - Generate multiple reports from one request, or ask for a text-only answer.
 - Inspect completed tool calls and download their parameters, outcomes, and dataset hash as JSON.
@@ -61,7 +61,7 @@ Use the original demo table for each example. The filtering example saves and se
 | --- | --- |
 | 我可以看一下这个数据库吗？ | A preview of the active table in the chat. |
 | 只看 `town = BISHAN`，按 `town` 画 `resale_price` 的均价图。 | A saved filtered table, a chart, and a validation record showing how many rows matched and the independently recomputed mean. |
-| 哪些字段与 `resale_price` 的关联最强？ | Separate rankings for numeric and categorical fields, with sample sizes and a partial validation status. |
+| 哪些字段与 `resale_price` 的关联最强？ | Candidate review followed by separate numeric and categorical rankings, with sample sizes and a partial validation status. |
 
 ### Command-line interface
 
@@ -107,6 +107,12 @@ Ask for the top N factors predicting a numeric column and their shares. The tool
 
 The tool needs at least 30 working rows with valid targets. It reports validation MAE against a median baseline and counts how many folds beat the baseline. The six-row HDB demo supports descriptive relationship rankings. Use a larger CSV for predictive importance. The browser's **因素重要性怎么解读** panel shows the baseline comparison, the percentage shares, and how stable the rankings were across the folds. These scores describe predictive performance on the supplied data. Establishing causation or generalization requires additional evidence.
 
+## Candidate field review
+
+Before ranking associations or feature importance, the agent reviews candidates against the chosen target on the active table. It records how many rows have values in both fields, how many different values remain, and whether each candidate was **入选**, **跳过**, or **待确认**. Constant fields, too few usable rows, and undersized groups for categorical association are examples of reasons to skip a field. High missingness is recorded alongside the decision.
+
+Identifier-like names and exact copies of the target are held for confirmation when otherwise eligible. Predictive importance also screens for common names that suggest the field becomes available after the outcome. These signals are heuristic and only cover some kinds of leakage. In the browser, open **查看执行记录 → 候选字段审查** for the reasons and row counts. The same evidence is in the JSON download. To include one of the preceding analysis's pending fields, send a line such as ``确认纳入 `order_id` ``. The agent reruns the tool with the same target and candidate scope. For a standalone CLI question, put ``Confirm inclusion of `order_id` `` on a separate line within the full request.
+
 ## Validation and recovery
 
 When validation runs, the progress bubble shows **正在校验**. Open **查看执行记录 → 校验结果** to see what the agent checked, the evidence or recomputed values, and any retry. The answer displays **校验通过**, **部分校验**, or **校验未通过**.
@@ -134,9 +140,8 @@ python -m pytest -q
 ## Backlog
 
 1. Extend independent recalculation to relationship rankings, trends, and feature importance. Expand scope checks beyond explicit field equality and compare stated numerical claims with structured results.
-2. Review the suitability of analysis candidates before ranking, including numeric identifiers, constant columns, missing values, and usable sample sizes.
-3. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model, and compare the results.
-4. Add regression cases for scope selection, numerical accuracy, and conclusions that overstate the evidence.
+2. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model, and compare the results.
+3. Add regression cases for scope selection, numerical accuracy, and conclusions that overstate the evidence.
 
 ## Safety and reproducibility
 

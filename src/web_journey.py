@@ -1,6 +1,7 @@
 """Readable descriptions of recorded tool decisions and results."""
 
 from src.web_progress import describe_call
+from src.tools.candidates import review_counts
 
 PURPOSES = {
     "dataset_overview": "先确认列名和数据规模，再选择适合的计算方法。",
@@ -54,7 +55,7 @@ def summarize_evidence(evidence: dict) -> tuple[list[str], list[dict]]:
                 {"字段": row["field"], "相关比 η": f"{row['eta']:.3f}", "有效行数": row["rows"], "类别数": row["groups"]}
                 for row in ranking["categorical"]
             ]})
-        if ranking["skipped_count"]:
+        if ranking["skipped_count"] and "candidate_review" not in evidence:
             notes.append(f"有 {ranking['skipped_count']:,} 个字段被跳过，具体原因见原始工具数据。")
         notes.append("两种指标各自在对应的字段类型内比较，结果描述当前样本里的关联。")
     if pair := evidence.get("pairwise_correlation"):
@@ -105,6 +106,9 @@ def describe_journey(steps: list[dict]) -> list[dict]:
             notes = ["这一步遇到错误，具体原因可在原始工具数据里查看。"]
         elif not notes:
             notes = ["工具返回了结果，全文可在原始工具数据里查看。"]
+        if review := step.get("evidence", {}).get("candidate_review"):
+            counts = review_counts(review)
+            notes.insert(0, f"候选字段审查 · {counts['included']} 个入选，{counts['excluded']} 个跳过，{counts['needs_confirmation']} 个待确认。")
         journey.append({
             "round": step.get("round"), "action": action.label if action else "调用分析工具", "status": status,
             "purpose": PURPOSES.get(name, ""), "method": list(action.details) if action else [],

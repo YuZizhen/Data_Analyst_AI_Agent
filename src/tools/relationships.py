@@ -4,11 +4,11 @@ from math import isclose, isfinite, sqrt
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import ToolException
-from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 from src.reports import render_report
 
-from .dataset import AnalysisContext, CHART_COLOR, column, finite_numbers, numeric_column, working_frame, working_source
+from .candidates import candidates_for_tool, review_counts
+from .dataset import AnalysisContext, CHART_COLOR, numeric_column, working_frame, working_source
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
 def relationship_report(
@@ -63,7 +63,7 @@ def rank_relationships(
     Args:
         target_column: Exact CSV column name of the numeric outcome to compare against.
         candidate_columns: Exact names of candidates explicitly requested by the user. Leave null for all other fields.
-        top_n: Maximum results to display per field type, between 1 and 25. All candidates are evaluated.
+        top_n: Maximum results to display per field type, between 1 and 25. Eligible fields are ranked.
     """
     if not 1 <= top_n <= 25:
         raise ToolException("top_n must be between 1 and 25.")
@@ -72,43 +72,39 @@ def rank_relationships(
     target = numeric_column(df, target_column)
     if target.nunique() < 2:
         raise ToolException("The numeric target must vary across rows.")
-    names = dict.fromkeys(df.columns if candidate_columns is None else candidate_columns)
-    names.pop(target_column, None)
+    review = candidates_for_tool(runtime, df, target_column, target, candidate_columns, "rank_relationships")
+    if review.values:
+        runtime.stream_writer({"event": "candidate_calculation", "tool": "rank_relationships", "args": {
+            "target_column": target_column, "candidate_columns": list(review.values), "top_n": top_n,
+        }})
     numeric = []
     categorical = []
-    skipped = []
-    for name in names:
-        candidate = column(df, name)
-        if is_numeric_dtype(candidate) and not is_bool_dtype(candidate):
-            values = finite_numbers(candidate)
-            valid = values.notna() & target.notna()
-            x, y = values[valid], target[valid]
-            if len(x) >= 3 and x.nunique() >= 2 and y.nunique() >= 2:
-                r = x.corr(y)
-                if isfinite(r):
-                    numeric.append((name, r, len(x)))
-                    continue
-            skipped.append(f"{name}: Pearson r requires at least 3 usable pairs and variation in both fields.")
+    for field in review.evidence["fields"]:
+        name = field["field"]
+        if name not in review.values:
             continue
-
-        valid = candidate.notna() & target.notna()
-        values = target[valid]
-        groups = values.groupby(candidate[valid], observed=True).agg(["size", "mean"])
-        if len(groups) < 2 or groups["size"].min() < 2 or values.nunique() < 2:
-            skipped.append(f"{name}: eta requires at least two groups, two usable rows per group and target variation.")
+        candidate = review.values[name].dropna()
+        values = target.loc[candidate.index]
+        if field["kind"] == "numeric":
+            r = candidate.corr(values)
+            if isfinite(r):
+                numeric.append((name, r, len(candidate)))
+            else:
+                review.skip_uncomputable(name)
             continue
+        groups = values.groupby(candidate, observed=True).agg(["size", "mean"])
         between = (groups["size"] * (groups["mean"] - values.mean()).pow(2)).sum()
         total = (values - values.mean()).pow(2).sum()
         if total > 0 and isfinite(total) and isfinite(between):
             categorical.append((name, sqrt(min(between / total, 1.0)), len(values), len(groups)))
         else:
-            skipped.append(f"{name}: group variation could not be computed.")
+            review.skip_uncomputable(name)
 
     numeric.sort(key=lambda item: abs(item[1]), reverse=True)
     categorical.sort(key=lambda item: item[1], reverse=True)
     lines = [
         f"Dataset: {working_source(context, runtime.state)}. Target: {target_column}. "
-        f"Evaluated {len(names)} candidate fields across {len(df)} rows."
+        f"Reviewed {len(review.evidence['fields'])} candidate fields across {len(df)} rows."
     ]
     if numeric:
         best_name, best_r, best_n = numeric[0]
@@ -129,11 +125,10 @@ def rank_relationships(
         )
         if len(categorical) == 1:
             lines.append("Only one categorical field was eligible, so it has no categorical comparator.")
-    if skipped:
-        lines.append("Skipped fields:\n- " + "\n- ".join(skipped))
     lines.append("These are descriptive associations. Compare scores within each ranking. They do not identify causal drivers.")
     return "\n".join(lines), {"relationship_ranking": {
-        "rows": len(df), "candidate_count": len(names), "skipped_count": len(skipped),
+        "rows": len(df), "candidate_count": len(review.evidence["fields"]),
+        "skipped_count": len(review.evidence["fields"]) - review_counts(review.evidence)["included"],
         "numeric": [{"field": name, "r": float(r), "rows": size} for name, r, size in numeric[:top_n]],
         "categorical": [
             {"field": name, "eta": eta, "rows": size, "groups": group_count}

@@ -5,7 +5,6 @@ import pandas as pd
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import ToolException
 from matplotlib.ticker import PercentFormatter
-from pandas.api.types import is_bool_dtype, is_datetime64_any_dtype, is_numeric_dtype
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
@@ -18,39 +17,13 @@ from sklearn.preprocessing import OneHotEncoder
 
 from src.reports import render_report
 
-from .dataset import AnalysisContext, CHART_COLOR, column, finite_numbers, numeric_column, working_frame, working_source
+from .candidates import candidates_for_tool
+from .dataset import AnalysisContext, CHART_COLOR, numeric_column, working_frame, working_source
 
 MIN_VALID_ROWS = 30
 VALIDATION_FOLDS = 3
 PERMUTATION_REPEATS = 5
 RANDOM_SEED = 42
-
-
-def prepare_features(frame: pd.DataFrame, fields: dict) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
-    features = {}
-    numeric, categorical, skipped = [], [], []
-    for field in fields:
-        series = column(frame, field)
-        if is_datetime64_any_dtype(series):
-            skipped.append(f"{field} (date column)")
-        elif is_numeric_dtype(series) and not is_bool_dtype(series):
-            series = finite_numbers(series).astype(float)
-            if series.nunique() < 2:
-                skipped.append(f"{field} (fewer than two usable numeric values)")
-            else:
-                features[field] = series
-                numeric.append(field)
-        else:
-            labels = series.astype("string").str.strip()
-            labels = labels.mask(labels.eq(""))
-            counts = labels.value_counts()
-            encoded = ("value:" + labels).fillna("missing").astype(object)
-            if encoded.nunique() < 2 or counts.empty or counts.max() < 2:
-                skipped.append(f"{field} (constant, blank, or all categories unique)")
-            else:
-                features[field] = encoded
-                categorical.append(field)
-    return pd.DataFrame(features, index=frame.index), numeric, categorical, skipped
 
 
 def validation_importance(
@@ -121,12 +94,20 @@ def feature_importance_report(
         )
     if target.nunique() < 2:
         raise ToolException("The numeric target must vary across rows.")
-    fields = dict.fromkeys(frame.columns if candidate_columns is None else candidate_columns)
-    fields.pop(target_column, None)
-    features, numeric, categorical, skipped = prepare_features(frame.loc[target.index], fields)
-    if not len(features.columns):
-        raise ToolException("No eligible candidate factors in the working data. Check the candidate columns and their values.")
+    review = candidates_for_tool(runtime, frame, target_column, target, candidate_columns, "feature_importance_report")
+    numeric = [row["field"] for row in review.evidence["fields"]
+               if row["status"] == "included" and row["kind"] == "numeric"]
+    categorical = [name for name in review.values if name not in numeric]
+    if not review.values:
+        raise ToolException("No eligible candidate factors in the working data. See the candidate review for details.")
+    features = pd.DataFrame({
+        **{name: review.values[name].astype(float) for name in numeric},
+        **{name: ("value:" + review.values[name].astype("string")).fillna("missing").astype(object) for name in categorical},
+    }, index=target.index)
 
+    runtime.stream_writer({"event": "candidate_calculation", "tool": "feature_importance_report", "args": {
+        "target_column": target_column, "candidate_columns": list(review.values), "top_n": top_n,
+    }})
     raw, fold_scores, model_mae, baseline_mae, baseline_wins = validation_importance(
         features, target, numeric, categorical,
     )
@@ -188,11 +169,10 @@ def feature_importance_report(
     if not other.empty:
         lines.append(f"- Other factors ({len(other)}): {other.sum():.1%}")
     lines.append(f"Evaluated {len(raw)} factors. {len(raw) - len(positive)} had zero or negative mean MAE increase.")
-    if skipped:
-        lines.append("Skipped: " + ", ".join(skipped) + ".")
     lines.append(
         "Shares divide each positive increase by the sum across all positive factors. "
         "Fold counts are descriptive stability checks. This measures model reliance during validation. "
-        "Correlated factors can share importance. Target leakage and generalization to other datasets were not tested."
+        "Correlated factors can share importance. Candidate screening only flags some possible leakage. "
+        "Generalization to other datasets was not tested."
     )
     return "\n".join(lines), artifact

@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from langchain.messages import AIMessage, ToolMessage
+from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
@@ -146,12 +146,42 @@ def test_rank_relationships_orders_absolute_r_and_skips_unusable_fields(tmp_path
     ])
     agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
     result = agent.invoke({"messages": [{"role": "user", "content": "Which field is most related to target?"}]})
-    report = tool_trace(result["messages"])[0]["result"]
+    step, = tool_trace(result["messages"])
+    report = step["result"]
     assert report.index("negative: Pearson r = -1.000") < report.index("weak: Pearson r")
     assert "label: eta = " in report
-    assert "constant: Pearson r requires" in report
-    assert "sparse: Pearson r requires" in report
-    assert "identifier: eta requires" in report
+    review = {item["field"]: item for item in step["evidence"]["candidate_review"]["fields"]}
+    assert review["constant"]["reasons"] == ["constant"]
+    assert review["sparse"]["usable_rows"] == 2 and review["sparse"]["reasons"] == ["few_pairs", "many_missing"]
+    assert review["identifier"]["status"] == "excluded" and "small_groups" in review["identifier"]["reasons"]
+
+
+def test_candidate_confirmation_reruns_only_the_previous_scope(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("market,price,order_id,copy,quantity,other\nA,10,6,10,2,1\nA,20,5,20,4,9\nA,30,4,30,2,17\n"
+                   "A,40,3,40,5,5\nA,50,2,50,3,12\nA,60,1,60,4,8\nB,80,7,99,2,1\n", encoding="utf-8")
+    model = ScriptedModel([
+        call_tool("filter_rows", "scope", column_name="market", operator="equals", value="A"),
+        call_tool("rank_relationships", "initial", target_column="price", candidate_columns=["order_id", "copy", "quantity"], top_n=2),
+        AIMessage(content="已完成关联排名。"),
+        AIMessage(content="已按确认重跑。"),
+    ])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    initial = graph.invoke({"messages": [HumanMessage(content="筛选 market = A，再比较 order_id、copy 和 quantity 与 price 的关联。")]})
+    history = initial["messages"]
+    _, first = tool_trace(history)
+    review = {row["field"]: row for row in first["evidence"]["candidate_review"]["fields"]}
+    assert review["copy"]["usable_rows"] == 6
+    assert review["order_id"]["status"] == review["copy"]["status"] == "needs_confirmation"
+    assert review["copy"]["reasons"] == ["target_copy"]
+    assert [row["field"] for row in first["evidence"]["relationship_ranking"]["numeric"]] == ["quantity"]
+    rerun = graph.invoke({"messages": [*history, HumanMessage(content="确认纳入 `order_id`")], "prepared": initial["prepared"]})
+    final, = tool_trace(rerun["messages"][len(history):])
+    assert final["parameters"] == first["parameters"]
+    review = {row["field"]: row for row in final["evidence"]["candidate_review"]["fields"]}
+    assert review["order_id"]["reasons"] == ["identifier", "manual_confirmation"]
+    assert review["copy"]["status"] == "needs_confirmation"
+    assert [row["field"] for row in final["evidence"]["relationship_ranking"]["numeric"]] == ["order_id", "quantity"]
 
 
 def test_top_factor_chart(tmp_path):
@@ -164,7 +194,8 @@ def test_top_factor_chart(tmp_path):
     csv = tmp_path / "products.csv"
     pd.DataFrame({
         "volume": volume, "item_type": item_type, "delivery": delivery,
-        "constant": 1, "price": price,
+        "constant": 1, "price": price, "price_recorded": price,
+        "post_sale_commission": price * 0.05,
     }).to_csv(csv, index=False)
     model = ScriptedModel([
         call_tool("feature_importance_report", "importance", target_column="price", top_n=1),
@@ -178,6 +209,9 @@ def test_top_factor_chart(tmp_path):
     assert "3-fold validation | 240 rows" in step["result"]
     assert "- volume:" in step["result"] and "Other factors (2)" in step["result"]
     assert "Skipped: constant" in step["result"]
+    reviewed = {row["field"]: row for row in step["evidence"]["candidate_review"]["fields"]}
+    assert reviewed["post_sale_commission"]["status"] == reviewed["price_recorded"]["status"] == "needs_confirmation"
+    assert reviewed["post_sale_commission"]["reasons"] == ["known_after"]
     tool_message = next(message for message in result["messages"] if isinstance(message, ToolMessage))
     evidence = tool_message.artifact["feature_importance"]
     assert evidence["baseline_wins"] == 3
@@ -198,6 +232,7 @@ def test_feature_importance_requires_validation_rows(tmp_path):
     result = agent.invoke({"messages": [{"role": "user", "content": "Show feature importance for the demo."}]})
     step, = tool_trace(result["messages"])
     assert step["status"] == "error" and "working data have 6" in step["result"]
+    assert step["evidence"]["candidate_review"]["target_rows"] == 6
     assert not list(tmp_path.glob("*.png"))
 
 

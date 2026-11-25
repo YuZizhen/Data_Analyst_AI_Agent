@@ -26,8 +26,11 @@ from src.agent import (
 from src import table_store
 from src.table_store import SavedTable, TableStore
 from src.tools import DATA_PATH, DEFAULT_PREVIEW_ROWS, AnalysisContext, PreparedDataset
+from src.tools.candidates import REASONS, STATUS_LABELS, review_counts
 from src.web_journey import describe_journey
-from src.web_progress import Activity, activity_for_update, activity_html, describe_call, update_validation_activity
+from src.web_progress import (
+    Activity, activity_for_update, activity_html, describe_call, update_candidate_activity, update_validation_activity,
+)
 
 DEMO_QUESTIONS = {
     "比较各区转售价": "生成各区平均转售价的柱状图，并指出哪个区最高。",
@@ -123,7 +126,7 @@ def analyze(
                 if mode == "values":
                     result = event
                 elif mode == "custom":
-                    if update_validation_activity(activity, event):
+                    if update_candidate_activity(activity, event) or update_validation_activity(activity, event):
                         show_activity(activity)
                 else:
                     for step in activity_for_update(event):
@@ -231,13 +234,45 @@ def show_importance_evidence(evidence: dict):
         st.caption("占比描述模型在这份数据里的预测依赖。相关字段可能分摊重要性，因果方向和其他数据上的表现需要额外验证。")
 
 
+def show_candidate_review(review: dict, *, rejected: bool):
+    with st.container(border=True):
+        method = "关联排名" if review["method"] == "rank_relationships" else "因素重要性"
+        st.text(f"{method} · 目标字段 {review['target']}")
+        counts = review_counts(review)
+        status = f"入选 {counts['included']} · 跳过 {counts['excluded']} · 待确认 {counts['needs_confirmation']}"
+        st.caption(f"{review['target_rows']:,} 行有有效目标值 · {status}")
+        if rejected:
+            st.caption("这次计算的结果已被校验节点排除。")
+        if review["fields"]:
+            kinds = {"numeric": "数值", "categorical": "分类", "date": "日期", "": "—"}
+            st.dataframe([
+                {"字段": row["field"], "审查结果": STATUS_LABELS[row["status"]], "类型": kinds[row["kind"]],
+                 "有效配对行数": row["usable_rows"], "不同取值数": row["distinct_values"],
+                 "原因": " ".join(REASONS[code] for code in row["reasons"])}
+                for row in review["fields"]
+            ], hide_index=True, width="stretch", column_config={"原因": st.column_config.TextColumn(width="large")})
+        else:
+            st.caption("当前请求没有可审查的候选字段。")
+        if counts["needs_confirmation"]:
+            first = next(row["field"] for row in review["fields"] if row["status"] == "needs_confirmation")
+            st.caption("待确认字段已暂缓纳入。确认其适合本次分析后，可以在聊天框发送下面的指令，重跑上一轮分析。")
+            st.code(f"确认纳入 `{first}`", language=None)
+
+
 def show_execution_record(turn: Turn, trace: dict):
     journey = describe_journey(trace["steps"])
     validation = trace.get("validation", [])
+    reviews = [(review, step.get("rejected_by_validation", False)) for step in trace["steps"]
+               if (review := step.get("evidence", {}).get("candidate_review"))]
     with st.expander("查看执行记录"):
-        tabs = ["分析旅程", "校验结果", "原始工具数据"] if validation else ["分析旅程", "原始工具数据"]
-        journey_tab, *validation_tabs, raw_tab = st.tabs(tabs)
-        with journey_tab:
+        labels = ["分析旅程"]
+        if reviews:
+            labels.append("候选字段审查")
+        if validation:
+            labels.append("校验结果")
+        labels.append("原始工具数据")
+        tabs = dict(zip(labels, st.tabs(labels)))
+        with tabs["分析旅程"]:
             st.markdown("**本轮问题**")
             st.text(trace["question"])
             input_table = trace.get("input_table")
@@ -263,8 +298,12 @@ def show_execution_record(turn: Turn, trace: dict):
                     for table in step["tables"]:
                         st.caption(table["title"])
                         st.dataframe(table["rows"], hide_index=True, width="stretch")
-        if validation_tabs:
-            with validation_tabs[0]:
+        if reviews:
+            with tabs["候选字段审查"]:
+                for review, rejected in reviews:
+                    show_candidate_review(review, rejected=rejected)
+        if validation:
+            with tabs["校验结果"]:
                 for attempt in validation:
                     with st.container(border=True):
                         status = VALIDATION_STATUSES[attempt["status"]]
@@ -276,7 +315,7 @@ def show_execution_record(turn: Turn, trace: dict):
                             st.caption(item["detail"])
                         if attempt["retrying"]:
                             st.caption("已根据这次校验的发现发起重试。")
-        with raw_tab:
+        with tabs["原始工具数据"]:
             for number, step in enumerate(trace["steps"], start=1):
                 st.text(f"{number}. {step['tool']} · {journey[number - 1]['status']}")
                 st.json(step["parameters"], expanded=False)

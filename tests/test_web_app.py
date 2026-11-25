@@ -120,11 +120,17 @@ def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypa
     assert not app.exception
     assert any("在 6 行中检查了 3 个候选字段" in item.value for item in app.text)
     assert any("多个候选字段逐一和同一个目标列比较" in item.value for item in app.text)
-    numeric, categorical = [item.value for item in app.dataframe[1:]]
+    numeric, categorical, review = [item.value for item in app.dataframe[1:]]
     assert numeric["Pearson r"].tolist() == ["+0.481", "+0.110"]
     assert categorical["相关比 η"].tolist() == ["0.954"]
     assert any("lease_years_remaining: Pearson r = +0.481" in item.value for item in app.code)
     assert any("部分校验" in item.value for item in app.warning)
+    assert any(tab.label == "候选字段审查" for tab in app.tabs)
+    assert set(review["字段"]) == {"lease_years_remaining", "floor_area_sqm", "town"}
+    assert review["审查结果"].tolist() == ["入选"] * 3
+    review_step, calculate_step, *_ = app.session_state.turns[0].activity
+    assert review_step.label == "正在审查候选字段" and "入选 3 个" in review_step.details[-1]
+    assert calculate_step.label == "比较字段关联强度"
 
 
 def test_browser_keeps_prepared_data_until_restored(monkeypatch):

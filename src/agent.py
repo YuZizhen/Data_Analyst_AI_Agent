@@ -11,6 +11,7 @@ from httpx import RequestError, Timeout, TimeoutException
 import pandas as pd
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages import RemoveMessage
+from langchain_core.tools import ToolException
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -41,6 +42,8 @@ from src.tools import (
     trend_report,
     working_frame,
 )
+from src.tools.candidates import CONFIRMATION, CANDIDATE_TOOLS, confirmed_fields, review_candidates, review_counts, review_summary
+from src.tools.dataset import numeric_column
 from src.validation import NUMERIC_TOOLS, analysis_scope, validate_results
 
 load_dotenv()
@@ -111,6 +114,9 @@ If the tool reports insufficient data or a failed validation baseline, explain t
 rank_relationships for descriptive associations if useful, without turning correlations into shares.
 If asked what is most strongly related to a numeric target, call rank_relationships before answering
 or plotting. Leave candidate_columns null unless the user explicitly restricts the candidates.
+Both rankings screen fields automatically. Explain meaningful exclusions, and describe pending fields
+as excluded until the user confirms them. If the user confirms a field in a follow-up chat message,
+rerun the preceding ranking or importance calculation with its original target and candidate scope.
 For a ranking, start with the heading "Numeric fields (Pearson r)" and name the strongest numeric
 field there, with its paired sample size. Use a separate "Categorical fields (eta)" heading if
 available. Translate the headings into the user's language, for example "数值字段" and "分类字段".
@@ -199,6 +205,25 @@ def first_preparation_call(calls):
     return next((call for call in calls if call["name"] in PREPARATION_NAMES), None)
 
 
+def previous_call_for_confirmation(messages):
+    question = messages[-1]
+    if not (isinstance(question, HumanMessage) and CONFIRMATION.fullmatch(question.text.strip())):
+        return None
+    requested = confirmed_fields(messages)
+    reviewed = set()
+    for message in reversed(messages[:-1]):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, ToolMessage) and (review := (message.artifact or {}).get("candidate_review")):
+            pending = {row["field"] for row in review["fields"] if row["status"] == "needs_confirmation"}
+            if requested <= pending:
+                reviewed.add(message.tool_call_id)
+        if isinstance(message, AIMessage):
+            if call := next((call for call in reversed(message.tool_calls) if call["id"] in reviewed), None):
+                return call
+    return None
+
+
 def build_analysis_graph(model, context: AnalysisContext):
     """Bind the shared workflow to a dataset and a report directory."""
     tool_options = {"parallel_tool_calls": False} if isinstance(model, ChatOpenAI) else {}
@@ -229,7 +254,29 @@ def build_analysis_graph(model, context: AnalysisContext):
                     content="A preparation step failed in this question. Resolve the failed step before analyzing data.",
                     name=call["name"], tool_call_id=call["id"], status="error",
                 )
+        review = None
+        if call["name"] in CANDIDATE_TOOLS:
+            try:
+                args = request.tool.tool_call_schema.model_validate(call["args"])
+                frame = working_frame(context, request.state)
+                target = numeric_column(frame, args.target_column)
+            except (ValidationError, ToolException):
+                return execute(request)
+            writer = request.runtime.stream_writer
+            writer({"event": "candidate_review", "stage": "start", "tool": call["name"], "target": args.target_column})
+            review = review_candidates(
+                frame, args.target_column, target, args.candidate_columns,
+                method=call["name"], confirmed=confirmed_fields(messages),
+            )
+            writer({"event": "candidate_review", "stage": "reviewed", "tool": call["name"],
+                    "target": args.target_column, "counts": review_counts(review.evidence)})
+            request = request.override(state={**request.state, "candidate_review": review})
         result = execute(request)
+        if review is not None and isinstance(result, ToolMessage):
+            result = result.model_copy(update={
+                "content": f"{result.text}\n\n{review_summary(review.evidence)}",
+                "artifact": {**(result.artifact or {}), "candidate_review": review.evidence},
+            })
         if call["name"] in NUMERIC_TOOLS and isinstance(result, ToolMessage) and result.status == "success":
             scope = analysis_scope(working_frame(context, request.state), request.state.get("prepared"))
             result = result.model_copy(update={"artifact": {**(result.artifact or {}), "analysis_scope": scope}})
@@ -240,7 +287,14 @@ def build_analysis_graph(model, context: AnalysisContext):
         message = messages[-1] if messages else None
         if isinstance(message, HumanMessage) and preview_request_language(message.text):
             return "request_preview"
+        if messages and previous_call_for_confirmation(messages) is not None:
+            return "rerun_confirmed"
         return "analyst"
+
+    def rerun_confirmed(state: AnalysisState):
+        call = previous_call_for_confirmation(state["messages"])
+        call = {**call, "id": f"confirmed-{uuid4().hex}"}
+        return {"messages": [AIMessage(content="", tool_calls=[call])], "tool_turns": 1}
 
     def request_preview(state: AnalysisState):
         call = AIMessage(content="", tool_calls=[{
@@ -327,11 +381,13 @@ def build_analysis_graph(model, context: AnalysisContext):
         StateGraph(AnalysisState, context_schema=AnalysisContext, input_schema=AnalysisInput)
         .add_node("analyst", analyst)
         .add_node("request_preview", request_preview)
+        .add_node("rerun_confirmed", rerun_confirmed)
         .add_node("tools", ToolNode(ANALYSIS_TOOLS, handle_tool_errors=True, wrap_tool_call=guard_preparation))
         .add_node("preview_answer", preview_answer)
         .add_node("validate", validate)
-        .add_conditional_edges(START, entry, ["request_preview", "analyst"])
+        .add_conditional_edges(START, entry, ["request_preview", "rerun_confirmed", "analyst"])
         .add_edge("request_preview", "tools")
+        .add_edge("rerun_confirmed", "tools")
         .add_conditional_edges("analyst", tools_condition, {"tools": "tools", END: "validate"})
         .add_conditional_edges("tools", after_tools, ["preview_answer", "analyst"])
         .add_conditional_edges("validate", after_validation, ["analyst", END])
@@ -344,6 +400,11 @@ def print_answer(agent, question: str, prepared: PreparedDataset | None = None) 
     result = agent.invoke({"messages": [{"role": "user", "content": question}], "prepared": prepared})
     messages = result["messages"]
     print(f"\nAnswer:\n{messages[-1].text}")
+    for step in tool_trace(messages, result.get("rejected_tool_calls", [])):
+        if review := step.get("evidence", {}).get("candidate_review"):
+            print(f"\n{step['tool']} · {review['target']}")
+            for row in review["fields"]:
+                print(f"{row['field']} · {row['status']} · {row['usable_rows']} usable rows · {', '.join(row['reasons'])}")
     for attempt in result.get("validation", []):
         print(f"\nValidation {attempt['attempt']} — {attempt['status']}")
         for item in attempt["checks"]:
@@ -382,7 +443,7 @@ def tool_trace(messages, rejected=()) -> list[dict]:
     batch = 0
     evidence_fields = (
         "row_change", "overview", "profile", "column_values", "relationship_ranking", "feature_importance",
-        "pairwise_correlation", "group_summary", "trend_summary", "distribution_summary",
+        "pairwise_correlation", "group_summary", "trend_summary", "distribution_summary", "candidate_review",
     )
     for message in messages:
         if isinstance(message, AIMessage) and message.tool_calls:
