@@ -10,6 +10,7 @@ A data analyst built with **LangChain**, **LangGraph**, **Pandas**, and **Matplo
 - Compare groups by mean, median, sum, or row count with a bar chart.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
 - Compare all candidate fields against a numeric target by ranking numeric Pearson correlations and categorical correlation ratios separately, with paired sample sizes.
+- Plot the top N predictive factors for a numeric target with percentage shares and an Other factors bar when needed.
 - Generate multiple reports from one request, or ask for a text-only answer.
 - Inspect completed tool calls and download their parameters, outcomes, and dataset hash as JSON.
 
@@ -80,11 +81,17 @@ Upload a UTF-8 CSV from any domain, including a CSV exported from a database. Us
 
 Tools can also profile the data, inspect common values, drop rows missing selected fields, deduplicate by selected fields or entire rows, and convert numbers, dates, or text. Failed conversions are counted, and an empty filter remains empty. The original CSV stays read-only. Execution records include preparation operations, parameters, and before-and-after row counts. Direct connections to live databases would require a separate data source adapter.
 
+### Feature importance
+
+Ask for the top N factors predicting a numeric column and their shares. The tool trains a random forest with three shuffled validation folds, shuffles each original factor independently, and measures the change in mean absolute error (MAE). The share divides each positive mean increase by the total across all positive factors. The chart shows the top N and groups the remaining positive shares under **Other factors**. Shares describe how this model uses the supplied data. Correlated factors can split or mask importance. Use only candidate fields available when making the prediction.
+
+The tool needs at least 30 working rows with valid targets and checks that validation MAE beats a median baseline. The six-row HDB demo supports descriptive relationship rankings. It is too small for a predictive importance report.
+
 ## How it works
 
 LangChain binds the analysis tools to the chat model. LangGraph routes simple browse requests straight to the preview tool. For analysis requests, the `analyst` node supplies the working schema and routes tool calls to `ToolNode`. Preparation tools update the working table in graph state. Dependent analysis calls run after that update. A run allows up to eight tool-call rounds. Pandas computes statistics and Matplotlib renders images.
 
-Tool modules live under `src/tools/`. `dataset.py` defines the shared data context, `inspection.py` shows rows and schema, `preprocessing.py` handles preparation, `charts.py` builds charts, and `relationships.py` handles association analysis.
+Tool modules live under `src/tools/`. `dataset.py` defines the shared data context, `inspection.py` shows rows and schema, `preprocessing.py` handles preparation, `charts.py` builds charts, `relationships.py` handles association analysis, and `importance.py` produces predictive importance reports.
 
 Run tests without making LLM API calls:
 

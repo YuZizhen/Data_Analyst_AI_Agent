@@ -95,6 +95,10 @@ def describe_call(name: str, args: dict) -> Activity | None:
             fields = "、".join(map(field_label, candidates)) if candidates else "其余字段"
             detail = f"逐列比较{fields}与{target}的关联。数值列按 |Pearson r| 排名，分类列单独计算 η。"
             return Activity("比较字段关联强度", details=(detail,))
+        case "feature_importance_report":
+            target = field_label(params.get("target_column"))
+            detail = f"预测{target}，在验证数据上逐列打乱取值，比较误差增量并绘制前 {params.get('top_n')} 个因素的占比。"
+            return Activity("绘制因素重要性图", "chart", (detail,))
         case "relationship_report":
             x_column = field_label(params.get("x_column"))
             y_column = field_label(params.get("y_column"))

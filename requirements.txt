@@ -4,6 +4,7 @@ langchain-openai
 langchain-ollama>=1.2,<2
 pandas>=2.0
 matplotlib>=3.8
+scikit-learn>=1.4.2,<2
 python-dotenv
 pytest
 streamlit>=1.56,<2

@@ -1,7 +1,10 @@
 """Exercise the LangGraph tool loop and PNG reports without API credentials."""
 
+import re
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 from langchain.messages import AIMessage, ToolMessage
 from langchain_ollama import ChatOllama
@@ -148,6 +151,48 @@ def test_rank_relationships_orders_absolute_r_and_skips_unusable_fields(tmp_path
     assert "constant: Pearson r requires" in report
     assert "sparse: Pearson r requires" in report
     assert "identifier: eta requires" in report
+
+
+def test_top_factor_chart(tmp_path):
+    random = np.random.default_rng(71)
+    count = 240
+    volume = random.uniform(5, 30, count)
+    item_type = random.choice(["basic", "premium"], count)
+    delivery = random.uniform(1, 5, count)
+    price = 100 + 18 * volume + np.where(item_type == "premium", 130, 0) + 16 * delivery
+    csv = tmp_path / "products.csv"
+    pd.DataFrame({
+        "volume": volume, "item_type": item_type, "delivery": delivery,
+        "constant": 1, "price": price,
+    }).to_csv(csv, index=False)
+    model = ScriptedModel([
+        call_tool("feature_importance_report", "importance", target_column="price", top_n=1),
+        AIMessage(content="The report is ready."),
+    ])
+    agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "Plot the most important factor and its share."}]})
+    step, = tool_trace(result["messages"])
+    assert step["status"] == "success"
+    assert step["parameters"]["top_n"] == 1
+    assert "3-fold validation | 240 rows" in step["result"]
+    assert "- volume:" in step["result"] and "Other factors (2)" in step["result"]
+    assert "Skipped: constant" in step["result"]
+    percentages = re.findall(r"(\d+\.\d)%", step["result"])
+    assert len(percentages) == 2 and sum(map(float, percentages)) == pytest.approx(100.0, abs=0.1)
+    png, = tmp_path.glob("importance-*.png")
+    assert png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_feature_importance_requires_validation_rows(tmp_path):
+    model = ScriptedModel([
+        call_tool("feature_importance_report", "importance", target_column="resale_price"),
+        AIMessage(content="The sample is too small for predictive importance."),
+    ])
+    agent = build_agent(model, output_dir=tmp_path)
+    result = agent.invoke({"messages": [{"role": "user", "content": "Show feature importance for the demo."}]})
+    step, = tool_trace(result["messages"])
+    assert step["status"] == "error" and "working data have 6" in step["result"]
+    assert not list(tmp_path.glob("*.png"))
 
 
 def test_filter_and_report(tmp_path):

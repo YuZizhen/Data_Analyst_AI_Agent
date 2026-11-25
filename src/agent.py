@@ -30,6 +30,7 @@ from src.tools import (
     dataset_preview,
     describe_dataset,
     distribution_report,
+    feature_importance_report,
     group_report,
     inspect_column_values,
     load_dataset,
@@ -68,6 +69,7 @@ ANALYSIS_TOOLS = [
     group_report,
     trend_report,
     distribution_report,
+    feature_importance_report,
     rank_relationships,
     relationship_report,
 ]
@@ -94,6 +96,11 @@ if the scale is unclear.
 If the user asks to see or browse the current data, table, CSV, or database, use dataset_preview
 to show actual rows. The application renders the preview table, so confirm it is available and
 let the user inspect it in the interface. For column names or row count alone, use dataset_overview.
+If asked for feature importance, top factors and their percentage shares, or a feature importance
+chart, use feature_importance_report and pass the requested top_n. Explain the shares as portions of
+the positive validation error increases, with any remaining positive factors grouped as Other.
+If the tool reports insufficient data or a failed validation baseline, explain that result. Use
+rank_relationships for descriptive associations if useful, without turning correlations into shares.
 If asked what is most strongly related to a numeric target, call rank_relationships before answering
 or plotting. Leave candidate_columns null unless the user explicitly restricts the candidates.
 For a ranking, start with the heading "Numeric fields (Pearson r)" and name the strongest numeric
