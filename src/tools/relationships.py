@@ -127,7 +127,7 @@ def rank_relationships(
             lines.append("Only one categorical field was eligible, so it has no categorical comparator.")
     lines.append("These are descriptive associations. Compare scores within each ranking. They do not identify causal drivers.")
     return "\n".join(lines), {"relationship_ranking": {
-        "rows": len(df), "candidate_count": len(review.evidence["fields"]),
+        "target": target_column, "rows": len(df), "candidate_count": len(review.evidence["fields"]),
         "skipped_count": len(review.evidence["fields"]) - review_counts(review.evidence)["included"],
         "numeric": [{"field": name, "r": float(r), "rows": size} for name, r, size in numeric[:top_n]],
         "categorical": [

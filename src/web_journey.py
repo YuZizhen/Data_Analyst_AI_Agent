@@ -1,6 +1,6 @@
 """Readable descriptions of recorded tool decisions and results."""
 
-from src.web_progress import describe_call
+from src.web_progress import PREDICTION_MODELS, describe_call
 from src.tools.candidates import review_counts
 
 PURPOSES = {
@@ -19,7 +19,10 @@ PURPOSES = {
     "distribution_report": "分区间数记录，可以看出值主要集中在哪里。",
     "rank_relationships": "回答哪个字段关联更强，需要把多个候选字段逐一和同一个目标列比较。",
     "relationship_report": "同时查看两个字段怎样变化，并用相关系数量化它们的线性关联。",
+    "group_distribution_report": "查看目标值在不同类别中的中位数和分布，补充分类关联的数值结果。",
     "feature_importance_report": "比较验证时打乱各个字段带来的误差变化，可以衡量模型更依赖哪些字段做预测。",
+    "evaluate_prediction": "用留出的记录衡量预测误差，再与只猜训练集中位数的基准比较。",
+    "predict_value": "用给定输入估算一条新记录，并用测试数据报告误差。",
 }
 
 
@@ -61,6 +64,10 @@ def summarize_evidence(evidence: dict) -> tuple[list[str], list[dict]]:
     if pair := evidence.get("pairwise_correlation"):
         r = "无法定义" if pair["r"] is None else f"{pair['r']:+.3f}"
         notes.append(f"使用 {pair['paired_rows']:,} 对有效值，当前表共 {pair['working_rows']:,} 行。Pearson r 为 {r}。")
+    if distribution := evidence.get("group_distribution"):
+        tables.append({"title": "箱线图中显示的类别", "rows": [
+            {"类别": row["group"], "有效行数": row["rows"], "中位数": row["median"]} for row in distribution["groups"]
+        ]})
     if groups := evidence.get("group_summary"):
         notes.append(f"使用 {groups['rows_used']:,} / {groups['working_rows']:,} 行，共得到 {groups['group_count']:,} 组。")
         tables.append({"title": "分组统计结果", "rows": [
@@ -76,12 +83,42 @@ def summarize_evidence(evidence: dict) -> tuple[list[str], list[dict]]:
             f"使用 {distribution['rows_used']:,} / {distribution['working_rows']:,} 行。"
             f"中位数为 {distribution['median']:,.8g}，范围为 {distribution['min']:,.8g} 至 {distribution['max']:,.8g}。"
         )
+    if evaluation := evidence.get("feature_importance") or evidence.get("prediction_evaluation"):
+        folds = evaluation["folds"]
+        details = evaluation.get("split_details", {"split": "cross_validation"})
+        split = {"random": "随机训练/测试切分", "chronological": "按时间训练/测试切分"}.get(details["split"], f"{folds} 折交叉验证")
+        model = evaluation.get("model", "random_forest")
+        notes.append(
+            f"{PREDICTION_MODELS.get(model, model)} · {split} · 使用 {evaluation['rows']:,} 行。"
+            f"模型 MAE 为 {evaluation['validation_mae']:,.6g}，中位数基准为 {evaluation['baseline_mae']:,.6g}。"
+        )
+        if fields := evaluation.get("fields"):
+            notes.append(f"输入字段 · {'、'.join(fields)}。")
+        params = evaluation.get("model_params", {})
+        common = {"max_depth": "最大深度", "min_samples_leaf": "叶节点最少记录", "n_estimators": "树数量", "alpha": "正则化系数"}
+        if settings := [f"{label} {params[key]}" for key, label in common.items() if key in params]:
+            notes.append(f"模型设置 · {' · '.join(settings)}。")
+        if details.get("split_seed") is not None:
+            notes.append(f"切分种子为 {details['split_seed']}。填补、编码和缩放参数使用训练集拟合。")
+        if details.get("test_size") is not None:
+            notes.append(f"请求的测试集占比为 {details['test_size']:.0%}。实际训练和测试行数见下表。")
+        if details.get("time_column"):
+            notes.append(f"按「{details['time_column']}」切分。训练截至 {details['train_to']}，测试始于 {details['test_from']}。"
+                         f"有 {details['invalid_time_rows']:,} 行日期缺失或不可解析。")
+        if evaluation.get("sample_seed") is not None:
+            notes.append(f"从 {evaluation['available_rows']:,} 行有效记录中随机抽样，抽样种子为 {evaluation['sample_seed']}。")
+        if scores := evaluation.get("scores"):
+            tables.append({"title": "训练与测试明细", "rows": [
+                {"折或切分": row["fold"], "训练行数": row["train_rows"], "测试行数": row["test_rows"],
+                 "MAE": row["model_mae"], "基准 MAE": row["baseline_mae"], "RMSE": row["rmse"], "R²": row["r2"]}
+                for row in scores
+            ]})
+        if estimate := evaluation.get("estimate"):
+            notes.append(f"单条估计值 {estimate['value']:,.8g}，估价模型使用 {estimate['training_rows']:,} 行训练。")
+            if estimate["unseen_categories"]:
+                notes.append(f"估价时遇到训练中未见的类别字段 · {'、'.join(estimate['unseen_categories'])}。")
     if importance := evidence.get("feature_importance"):
         folds = importance["folds"]
-        notes.append(
-            f"使用 {importance['rows']:,} 行进行 {folds} 折验证。模型误差为 {importance['validation_mae']:,.4g}，"
-            f"中位数基准为 {importance['baseline_mae']:,.4g}，模型在 {importance['baseline_wins']}/{folds} 折优于基准。"
-        )
         tables.append({"title": "图中单列因素的验证结果", "rows": [
             {"因素": row["field"], "占比": f"{row['share']:.1%}", "打乱后误差上升的折数": f"{row['positive_folds']}/{folds}"}
             for row in importance["factors"]

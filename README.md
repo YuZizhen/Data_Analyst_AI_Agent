@@ -73,7 +73,7 @@ Start Ollama and check that the model you want appears in `ollama list`. The age
 python -m src.agent --provider ollama --model qwen3.5:4b --question "Compare average resale price by town and plot the distribution of resale prices."
 ```
 
-This mode needs no OpenAI API key. It connects to `http://127.0.0.1:11434` by default. Set `OLLAMA_BASE_URL` in `.env` if your Ollama server runs at a different address. Ollama manages model storage through its own settings, including `OLLAMA_MODELS`.
+This mode needs no OpenAI API key. It connects to `http://127.0.0.1:11434` by default. Set `OLLAMA_BASE_URL` in `.env` if your Ollama server runs at a different address. The agent requests an 8,192-token Ollama context for tool definitions, chat history, and replies. `OLLAMA_NUM_CTX` overrides it. Larger contexts use more memory. Ollama manages model storage through its own settings, including `OLLAMA_MODELS`.
 
 #### OpenAI API
 
@@ -101,7 +101,13 @@ Upload a UTF-8 CSV from any domain, including a CSV exported from a database. Us
 
 Tools can also profile the data, inspect common values, drop rows missing selected fields, deduplicate by selected fields or entire rows, and convert numbers, dates, or text. Failed conversions are counted, and an empty filter remains empty. The original CSV stays read-only. Execution records include preparation operations, parameters, and before-and-after row counts. Direct connections to live databases would require a separate data source adapter.
 
-### Feature importance
+### Regression and feature importance
+
+Ask “用一棵简单的决策树预测 `RESALE_PRICE`，75% 训练、25% 测试” to evaluate a model. Choose a single shallow decision tree, linear regression, ridge regression, or random forest. The default evaluation uses a random 80/20 split. You can request a chronological split with a date field, or three-fold cross-validation. A chronological split keeps records sharing a date together and reports the actual counts and boundary. The execution record includes model parameters, features, train/test counts, MAE, median-baseline MAE, RMSE, and R². Trainable preprocessing, including imputation and categorical encoding, uses only the training subset.
+
+For an individual estimate, give the user-known inputs, for example “用决策树估价 `FLOOR_AREA_SQM` 为 90、`FLAT_TYPE` 为 `4 ROOM` 的房源，目标是 `RESALE_PRICE`”。 The estimate uses only the specified eligible columns and includes held-out error. The language model can inspect an unfamiliar CSV's schema and categories to map the question to tools. Supported estimators are defined in the project. The tools use up to 12,000 usable rows, sampled with a fixed seed for larger tables, and retain the original and sampled counts in the execution record.
+
+A feature-importance request uses a separate report, with training and permutation progress shown in the browser. When asking for a chart after a field association ranking, the browser uses a scatter plot and a grouped box plot for the leading eligible fields on the same working table.
 
 Ask for the top N factors predicting a numeric column and their shares. The tool trains a random forest with three shuffled validation folds, shuffles each original factor independently, and measures the change in mean absolute error (MAE). The share divides each positive mean increase by the total across all positive factors. The chart shows the top N and groups the remaining positive shares under **Other factors**. Shares describe how this model uses the supplied data. Correlated factors can split or mask importance. Use only candidate fields available when making the prediction.
 
@@ -109,7 +115,7 @@ The tool needs at least 30 working rows with valid targets. It reports validatio
 
 ## Candidate field review
 
-Before ranking associations or feature importance, the agent reviews candidates against the chosen target on the active table. It records how many rows have values in both fields, how many different values remain, and whether each candidate was **入选**, **跳过**, or **待确认**. Constant fields, too few usable rows, and undersized groups for categorical association are examples of reasons to skip a field. High missingness is recorded alongside the decision.
+Before ranking associations, evaluating predictions, or computing feature importance, the agent reviews candidates against the chosen target on the active table. It records how many rows have values in both fields, how many different values remain, and whether each candidate was **入选**, **跳过**, or **待确认**. Constant fields, too few usable rows, and undersized groups for categorical association are examples of reasons to skip a field. High missingness is recorded alongside the decision.
 
 Identifier-like names and exact copies of the target are held for confirmation when otherwise eligible. Predictive importance also screens for common names that suggest the field becomes available after the outcome. These signals are heuristic and only cover some kinds of leakage. In the browser, open **查看执行记录 → 候选字段审查** for the reasons and row counts. The same evidence is in the JSON download. To include one of the preceding analysis's pending fields, send a line such as ``确认纳入 `order_id` ``. The agent reruns the tool with the same target and candidate scope. For a standalone CLI question, put ``Confirm inclusion of `order_id` `` on a separate line within the full request.
 

@@ -15,10 +15,15 @@ from src.tools.preprocessing import PREPARATION_FUNCTIONS, filter_frame
 
 NUMERIC_TOOLS = {
     "average_by_group", "group_report", "trend_report", "distribution_report",
-    "rank_relationships", "relationship_report", "feature_importance_report",
+    "rank_relationships", "relationship_report", "group_distribution_report", "feature_importance_report", "evaluate_prediction", "predict_value",
 }
 SCOPE_WORDS = re.compile(r"只(?:看|分析|保留|统计|筛选|比较)|仅(?:看|分析|保留|统计)|\bonly (?:rows|records|include|analy[sz]e)", re.I)
 CLAIM = re.compile(r"导致|显著(?:影响|相关|提高|降低)|决定了|证明.{0,10}因果|\bcaus(?:e[ds]?|ally)\b|statistically significant", re.I)
+RANK_OVERCLAIM = re.compile(r"(?:最为?显著|影响(?:最强|最大)|most significant|greatest impact)", re.I)
+IMPORTANCE_OVERCLAIM = re.compile(
+    r"(?:贡献|占).{0,25}(?:预测误差|总误差)(?!\s*(?:的)?(?:增量|增加|变化))"
+    r"|account(?:s|ed)? for.{0,28}(?:prediction|total) error\b(?!\s*(?:increase|change))", re.I,
+)
 CAVEAT = re.compile(r"不(?:能|可|代表|说明|足以|证明|表示)|无(?:法|证据)|没有(?:证据|做|进行|证明)|未(?:经|做|检验|证明)|\b(?:not|cannot|no evidence|doesn.t)\b", re.I)
 
 
@@ -149,6 +154,8 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
     evidence_to_check = []
     for tool in tools:
         evidence = tool.artifact or {}
+        supplied_values = evidence.get("prediction_evaluation", {}).get("estimate", {}).get("inputs", {})
+        training_conditions = [(field, value) for field, value in conditions if field not in supplied_values]
         scope = evidence.get("analysis_scope")
         if scope is None:
             checks.append(check("数据范围", "limited", "这次调用缺少可核对的数据范围记录。", tool=tool.name))
@@ -162,17 +169,21 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
             checks.append(check("数据范围", "failed", "按已记录的步骤重建的数据，与工具实际使用的数据不一致。", tool=tool.name))
             invalid.add(tool.tool_call_id)
             continue
-        checks.append(check("数据范围", "passed", f"重建了 {len(frame):,} 行，核对行内容和字段类型，与计算所用数据一致。", tool=tool.name))
-        if not conditions and SCOPE_WORDS.search(question):
+        prediction = evidence.get("prediction_evaluation") or evidence.get("feature_importance")
+        scope_detail = f"重建了 {len(frame):,} 行，核对行内容和字段类型，与工具收到的工作表一致。"
+        if prediction:
+            scope_detail += f"报告中的预测评估使用其中 {prediction['rows']:,} 行。"
+        checks.append(check("数据范围", "passed", scope_detail, tool=tool.name))
+        if not training_conditions and SCOPE_WORDS.search(question):
             checks.append(check("问题的筛选条件", "limited", "这轮包含范围限制。独立核对支持明确写出的字段等值条件。", tool=tool.name))
-        for field, value in conditions:
+        for field, value in training_conditions:
             try:
                 matching = len(filter_frame(frame, field, "equals", value))
             except ToolException:
                 matching = 0
             valid = matching == len(frame) and bool(len(frame))
             checks.append(check("问题的筛选条件", "passed" if valid else "failed",
-                                f"计算所用 {len(frame):,} 行中，有 {matching:,} 行满足「{field} = {value}」。", tool=tool.name))
+                                f"工具收到的 {len(frame):,} 行中，有 {matching:,} 行满足「{field} = {value}」。", tool=tool.name))
             if not valid:
                 invalid.add(tool.tool_call_id)
         evidence_to_check.append((tool, evidence, frame))
@@ -195,9 +206,14 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
     emit("conclusion")
     draft = current[-1].text if current and isinstance(current[-1], AIMessage) else ""
     clauses = re.split(r"[。！？\n；;]|但(?:是)?|不过|\b(?:but|however)\b", draft, flags=re.I)
-    flagged = any(CLAIM.search(part) and not CAVEAT.search(part) for part in clauses)
+    patterns = [CLAIM]
+    if any(tool.name == "rank_relationships" for tool in tools):
+        patterns.append(RANK_OVERCLAIM)
+    if any(tool.name == "feature_importance_report" for tool in tools):
+        patterns.append(IMPORTANCE_OVERCLAIM)
+    flagged = any(pattern.search(part) and not CAVEAT.search(part) for pattern in patterns for part in clauses)
     if flagged:
-        checks.append(check("结论措辞", "failed", "结论里有因果或显著性表述。请改为描述当前数据中的关联或验证表现。"))
+        checks.append(check("结论措辞", "failed", "检查发现因果、显著性或误差占比表述可能超出证据。请描述样本关联或打乱字段后产生的正向误差增量占比。"))
     else:
         checks.append(check("结论措辞", "passed", "已扫描常见的因果和显著性断言。这项检查关注措辞边界。"))
     return checks, invalid

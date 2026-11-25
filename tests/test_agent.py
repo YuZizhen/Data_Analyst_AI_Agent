@@ -11,7 +11,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_artifacts, tool_trace
-from src.tools import charts
+from src.tools import charts, predictions
 
 
 class ScriptedModel:
@@ -36,6 +36,7 @@ def call_tool(name, call_id, **args):
 
 def test_ollama_can_use_an_installed_model_without_an_openai_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
     monkeypatch.setenv("MODEL_PROVIDER", "ollama")
     monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:4b")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435")
@@ -43,6 +44,9 @@ def test_ollama_can_use_an_installed_model_without_an_openai_key(monkeypatch):
     assert isinstance(model, ChatOllama)
     assert model.model == "qwen3.5:4b"
     assert model.base_url == "http://127.0.0.1:11435"
+    assert model.num_ctx == 8192
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
+    assert build_model().num_ctx == 16384
     assert build_model("ollama", "another-model:latest").model == "another-model:latest"
 
 
@@ -132,6 +136,44 @@ def test_rank_relationships_compares_lease_area_and_town(tmp_path):
     assert "town: eta = 0.954, n = 6, groups = 3" in report
 
 
+def test_empty_or_truncated_model_response_recovers_ranking(tmp_path):
+    model = ScriptedModel([
+        AIMessage(content=""),
+        call_tool("rank_relationships", "compare", target_column="resale_price"),
+        AIMessage(content="尚未结束的回复 **", response_metadata={"done_reason": "length"}),
+        AIMessage(content=" "),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="这个数据需要预处理吗？"), AIMessage(content="字段已检查。"),
+        HumanMessage(content="那hdb的价格和什么因素有关呢"),
+    ]})
+    step, = tool_trace(result["messages"])
+    assert step["tool"] == "rank_relationships" and step["status"] == "success"
+    reply = result["messages"][-1].text
+    assert "尚未结束" not in reply
+    assert "`lease_years_remaining` · Pearson r = +0.481" in reply
+    assert "`town` · η = 0.954" in reply and "合成示例数据的 6 行" in reply
+    assert len(model.prompts) == 4 and "empty or cut off" in model.prompts[1]
+    assert result["validation"][-1]["status"] == "limited"
+
+
+def test_chart_followup_plots_the_previous_ranking_without_training(tmp_path):
+    model = ScriptedModel([
+        call_tool("rank_relationships", "rank", target_column="resale_price"),
+        AIMessage(content="比较了两类字段。"),
+        AIMessage(content="已绘制散点图和分组箱线图。"),
+    ])
+    graph = build_agent(model, output_dir=tmp_path)
+    ranked = graph.invoke({"messages": [HumanMessage(content="房价最相关的因素是什么？")]})
+    history = ranked["messages"]
+    result = graph.invoke({"messages": [*history, HumanMessage(content="可以给我输出图标吗？")]})
+    scatter, grouped = tool_trace(result["messages"][len(history):])
+    assert scatter["tool"] == "relationship_report" and scatter["parameters"]["x_column"] == "lease_years_remaining"
+    assert grouped["tool"] == "group_distribution_report" and grouped["parameters"]["group_column"] == "town"
+    assert scatter["status"] == grouped["status"] == "success", grouped["result"]
+    assert len(list(tmp_path.glob("*.png"))) == 2
+
+
 def test_rank_relationships_orders_absolute_r_and_skips_unusable_fields(tmp_path):
     csv = tmp_path / "sample.csv"
     csv.write_text(
@@ -199,16 +241,23 @@ def test_top_factor_chart(tmp_path):
     }).to_csv(csv, index=False)
     model = ScriptedModel([
         call_tool("feature_importance_report", "importance", target_column="price", top_n=1),
-        AIMessage(content="The report is ready."),
+        AIMessage(content="面积贡献了超过三分之一的预测误差。"),
+        AIMessage(content="占比表示逐列打乱后正向误差增量中的份额。"),
     ])
     agent = build_agent(model, csv_path=csv, output_dir=tmp_path)
-    result = agent.invoke({"messages": [{"role": "user", "content": "Plot the most important factor and its share."}]})
+    events = list(agent.stream({"messages": [{"role": "user", "content": "Plot the most important factor and its share."}]},
+                               stream_mode=["values", "custom"]))
+    result = next(value for mode, value in reversed(events) if mode == "values")
+    phases = [(value["stage"], value["fold"]) for mode, value in events
+              if mode == "custom" and value["event"] == "prediction_progress"]
+    assert phases == [("fit", 1), ("fit", 2), ("fit", 3), ("importance", 1), ("importance", 2), ("importance", 3), ("chart", None)]
     step, = tool_trace(result["messages"])
     assert step["status"] == "success"
     assert step["parameters"]["top_n"] == 1
     assert "3-fold validation | 240 rows" in step["result"]
     assert "- volume:" in step["result"] and "Other factors (2)" in step["result"]
     assert "Skipped: constant" in step["result"]
+    assert [attempt["status"] for attempt in result["validation"]] == ["failed", "limited"]
     reviewed = {row["field"]: row for row in step["evidence"]["candidate_review"]["fields"]}
     assert reviewed["post_sale_commission"]["status"] == reviewed["price_recorded"]["status"] == "needs_confirmation"
     assert reviewed["post_sale_commission"]["reasons"] == ["known_after"]
@@ -221,6 +270,79 @@ def test_top_factor_chart(tmp_path):
     assert len(percentages) == 2 and sum(map(float, percentages)) == pytest.approx(100.0, abs=0.1)
     png, = tmp_path.glob("importance-*.png")
     assert png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_prediction_feasibility_samples_and_skips_importance(tmp_path, monkeypatch):
+    csv = tmp_path / "prices.csv"
+    frame = pd.DataFrame({"size": np.arange(120), "amount": np.arange(120) * 2 + 50})
+    frame.to_csv(csv, index=False)
+    monkeypatch.setattr(predictions, "MAX_MODEL_ROWS", 60)
+    model = ScriptedModel([
+        call_tool("evaluate_prediction", "assessment", target_column="amount"),
+        AIMessage(content="验证误差比中位数基准低。"),
+    ])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    events = list(graph.stream({"messages": [HumanMessage(content="那我可以预测二手售卖的价格吗？")]},
+                               stream_mode=["values", "custom"]))
+    result = next(value for mode, value in reversed(events) if mode == "values")
+    phases = [(value["stage"], value["fold"]) for mode, value in events
+              if mode == "custom" and value["event"] == "prediction_progress"]
+    assert phases == [("fit", 1)]
+    step, = tool_trace(result["messages"])
+    review = step["evidence"]["candidate_review"]
+    evidence = step["evidence"]["prediction_evaluation"]
+    assert evidence["rows"] == 60 and evidence["available_rows"] == review["target_rows"] == 120
+    assert evidence["sample_seed"] == predictions.RANDOM_SEED
+    assert evidence["scores"][0]["train_rows"] == 48 and evidence["scores"][0]["test_rows"] == 12
+    assert evidence["validation_mae"] < evidence["baseline_mae"]
+    assert not list(tmp_path.glob("*.png"))
+
+
+@pytest.mark.parametrize("model_name", ["decision_tree", "linear_regression", "ridge", "random_forest"])
+def test_prediction_estimates_a_record_with_the_requested_model_and_split(tmp_path, model_name):
+    csv = tmp_path / "sales.csv"
+    size = np.arange(100)
+    pd.DataFrame({"size": size, "price": 20 + 3 * size}).to_csv(csv, index=False)
+    model = ScriptedModel([
+        call_tool("predict_value", "estimate", target_column="price", inputs={"size": 44}, model=model_name,
+                  split="random", test_size=0.25),
+        AIMessage(content="结果来自模型估算。"),
+    ])
+    result = build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="估算 size = 44 的价格，用我要求的模型，留 25% 测试。"),
+    ]})
+    step, = tool_trace(result["messages"])
+    assert step["status"] == "success", step["result"]
+    evidence = step["evidence"]["prediction_evaluation"]
+    assert evidence["model"] == model_name and evidence["split_details"]["test_size"] == 0.25
+    score, = evidence["scores"]
+    assert (score["train_rows"], score["test_rows"]) == (75, 25)
+    assert score["model_mae"] < score["baseline_mae"] and score["r2"] > 0.8
+    assert evidence["estimate"]["value"] == pytest.approx(152, abs=15)
+    assert evidence["estimate"]["training_rows"] == 75
+    assert result["validation"][-1]["status"] == "limited"
+
+
+def test_prediction_chronological_split_keeps_whole_dates_together(tmp_path):
+    csv = tmp_path / "sales.csv"
+    dates = np.repeat(pd.date_range("2024-01-01", periods=4, freq="MS").strftime("%Y-%m"), [20, 20, 20, 30])
+    size = np.tile(np.arange(10), 9)
+    pd.DataFrame({"month": dates, "size": size, "price": 20 + 3 * size}).to_csv(csv, index=False)
+    model = ScriptedModel([
+        call_tool("evaluate_prediction", "dated", target_column="price", candidate_columns=["size"],
+                  model="decision_tree", split="chronological", time_column="month", test_size=0.2),
+        AIMessage(content="已按时间验证。"),
+    ])
+    result = build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="用时间切分检查预测精度。"),
+    ]})
+    step, = tool_trace(result["messages"])
+    assert step["status"] == "success", step["result"]
+    evidence = step["evidence"]["prediction_evaluation"]
+    details = evidence["split_details"]
+    score, = evidence["scores"]
+    assert (score["train_rows"], score["test_rows"]) == (60, 30)
+    assert details["train_to"].startswith("2024-03-01") and details["test_from"].startswith("2024-04-01")
 
 
 def test_feature_importance_requires_validation_rows(tmp_path):

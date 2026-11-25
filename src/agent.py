@@ -32,10 +32,13 @@ from src.tools import (
     dataset_preview,
     describe_dataset,
     distribution_report,
+    evaluate_prediction,
     feature_importance_report,
+    group_distribution_report,
     group_report,
     inspect_column_values,
     load_dataset,
+    predict_value,
     profile_dataset,
     rank_relationships,
     relationship_report,
@@ -44,12 +47,13 @@ from src.tools import (
 )
 from src.tools.candidates import CONFIRMATION, CANDIDATE_TOOLS, confirmed_fields, review_candidates, review_counts, review_summary
 from src.tools.dataset import numeric_column
-from src.validation import NUMERIC_TOOLS, analysis_scope, validate_results
+from src.validation import NUMERIC_TOOLS, analysis_scope, frame_signature, validate_results
 
 load_dotenv()
 
 DEFAULT_OUTPUT_DIR = DATA_PATH.parent.parent / "reports"
 MAX_TOOL_TURNS = 8
+DEFAULT_OLLAMA_CONTEXT = 8192
 CHINESE_PREVIEW_REQUEST = re.compile(
     r"(?:请(?:问)?\s*)?(?:我(?:想|能|可以)?\s*)?(?:能(?:不能|否)?|可以)?\s*(?:给我|帮我|让我)?\s*"
     r"(?:看(?:一下|一眼|看)?|查看(?:一下)?|浏览(?:一下)?|预览(?:一下)?|展示(?:一下)?)\s*"
@@ -72,8 +76,11 @@ ANALYSIS_TOOLS = [
     *PREPARATION_TOOLS,
     average_by_group,
     group_report,
+    group_distribution_report,
     trend_report,
     distribution_report,
+    evaluate_prediction,
+    predict_value,
     feature_importance_report,
     rank_relationships,
     relationship_report,
@@ -102,9 +109,25 @@ if the scale is unclear.
 If the user asks to see or browse the current data, table, CSV, or database, use dataset_preview
 to show actual rows. The application renders the preview table, so confirm it is available and
 let the user inspect it in the interface. For column names or row count alone, use dataset_overview.
+For questions like "那我可以预测二手售卖的价格吗" or "how accurate could a price prediction be?",
+use evaluate_prediction. Give the validation MAE and median baseline, and note sampled rows if any.
+An assessment estimates typical error on held-out data; it does not predict a value for a specific item.
+If the user wants a specific estimate, ask for the known input values when missing; call predict_value
+with exactly the user-supplied inputs mapped to columns. Never invent an input. When unsure about
+column names or categories, inspect the schema or common values before calling a prediction tool.
+Honor a requested model (single/simple tree = decision_tree, linear regression = linear_regression,
+ridge = ridge, random forest = random_forest) and requested split or test fraction. If the user asks
+for future performance, use a chronological split when a suitable date column is known, or ask
+which date to use. Compare requested models with the same fields and split parameters. Report the
+actual model, split, training/test row counts, and held-out error. If an algorithm is unsupported,
+explain that and offer the supported models; do not silently switch algorithms.
+If "预测一下" could mean either an assessment or a specific estimate and no inputs were provided,
+give the assessment and ask one focused follow-up for the actual inputs if the user wants an estimate.
 If asked for feature importance, top factors and their percentage shares, or a feature importance
 chart, use feature_importance_report and pass the requested top_n. Explain the shares as portions of
 the positive validation error increases, with any remaining positive factors grouped as Other.
+Never describe a permutation share as a portion of overall error or of the actual target value.
+State the number of factors actually shown. The requested top_n is only an upper limit.
 When interpreting whether a feature-importance result holds, reference the working sample size,
 held-out model MAE versus the median baseline, and each cited feature's positive-fold or leading-fold
 count. Explain instability if the winner does not consistently lead. Describe predictive reliance
@@ -114,15 +137,21 @@ If the tool reports insufficient data or a failed validation baseline, explain t
 rank_relationships for descriptive associations if useful, without turning correlations into shares.
 If asked what is most strongly related to a numeric target, call rank_relationships before answering
 or plotting. Leave candidate_columns null unless the user explicitly restricts the candidates.
-Both rankings screen fields automatically. Explain meaningful exclusions, and describe pending fields
+Candidate-based analyses screen fields automatically. Explain meaningful exclusions, and describe pending fields
 as excluded until the user confirms them. If the user confirms a field in a follow-up chat message,
 rerun the preceding ranking or importance calculation with its original target and candidate scope.
 For a ranking, start with the heading "Numeric fields (Pearson r)" and name the strongest numeric
 field there, with its paired sample size. Use a separate "Categorical fields (eta)" heading if
 available. Translate the headings into the user's language, for example "数值字段" and "分类字段".
+Keep Pearson r and eta in separate rankings, including in summaries and follow-up answers.
+Never call a categorical field strongest overall or put it ahead of a numeric field. Say
+"关联" rather than "影响" when explaining an association ranking in Chinese.
 These descriptive scores support neither causal effects nor claims of statistical significance.
 A single pairwise scatter plot cannot establish a ranking. A ranking is sufficient for this
 question unless a figure is requested. Call out synthetic demo data and small samples.
+For a chart follow-up to an association ranking, visualize that ranking with a scatter plot for
+the top numeric field and group_distribution_report for the top categorical field, when available.
+Use predictive importance only if requested. Explain when just one field qualified in a ranking.
 When the user asks to analyze numeric data, generate the relevant PNG reports by default.
 Create a report for each distinct requested view, unless the user requests a text-only answer.
 For a schema-only question, use the overview. For text-only grouped means, use average_by_group.
@@ -179,11 +208,18 @@ def build_model(provider: str | None = None, model_name: str | None = None, *, a
         raise ValueError(f"Unknown model provider {provider!r}. Choose openai or ollama.")
     model_name = model_name or default_model_name(provider)
     if provider == "ollama":
+        try:
+            context_size = int(os.getenv("OLLAMA_NUM_CTX") or DEFAULT_OLLAMA_CONTEXT)
+            if context_size <= 0:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError("OLLAMA_NUM_CTX must be a positive integer.") from error
         return ChatOllama(
             model=model_name,
             base_url=os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434",
             temperature=0,
             reasoning=False,
+            num_ctx=context_size,
             client_kwargs={"timeout": Timeout(180, connect=5), "trust_env": False},
         )
     api_key = (api_key or os.getenv("OPENAI_API_KEY", "")).strip()
@@ -222,6 +258,97 @@ def previous_call_for_confirmation(messages):
             if call := next((call for call in reversed(message.tool_calls) if call["id"] in reviewed), None):
                 return call
     return None
+
+
+def usable_response(response: AIMessage) -> bool:
+    if response.tool_calls:
+        return True
+    metadata = response.response_metadata
+    truncated = metadata.get("done_reason") == "length" or metadata.get("finish_reason") in {"length", "max_tokens"}
+    return bool(response.text.strip()) and not truncated and not response.invalid_tool_calls
+
+
+BARE_CHART_REQUEST = re.compile(
+    r"(?:那\s*)?(?:可以|能|请)?(?:给我|帮我)?(?:输出|生成|绘制|画|做|展示)(?:一张|个|几张|一下)?(?:图表|图标|图)(?:吗|呢)?"
+    r"|(?:can you |please )?(?:plot|chart|visuali[sz]e)(?: (?:it|that|the results))?", re.I,
+)
+
+
+def ranking_chart_requests(messages, frame):
+    question = messages[-1] if messages else None
+    if not isinstance(question, HumanMessage) or not BARE_CHART_REQUEST.fullmatch(question.text.strip().rstrip("?？。!！")):
+        return []
+    for message in reversed(messages[:-1]):
+        if isinstance(message, HumanMessage):
+            break
+        if not isinstance(message, ToolMessage) or message.status != "success":
+            continue
+        artifact = message.artifact or {}
+        ranking, scope = artifact.get("relationship_ranking"), artifact.get("analysis_scope")
+        if not ranking or not scope or frame_signature(frame) != scope["signature"]:
+            continue
+        target = ranking.get("target") or artifact.get("candidate_review", {}).get("target")
+        if target not in frame.columns:
+            continue
+        requested = []
+        if ranking["numeric"]:
+            requested.append(("relationship_report", {"x_column": ranking["numeric"][0]["field"], "y_column": target}))
+        if ranking["categorical"]:
+            requested.append(("group_distribution_report", {"group_column": ranking["categorical"][0]["field"], "value_column": target}))
+        return requested
+    return []
+
+
+def fallback_answer(history, *, demo: bool) -> AIMessage:
+    current_tools = []
+    for message in reversed(history):
+        if isinstance(message, HumanMessage):
+            chinese = bool(re.search(r"[\u3400-\u9fff]", message.text))
+            break
+        if isinstance(message, ToolMessage):
+            current_tools.append(message)
+    else:
+        chinese = False
+
+    if any(message.status == "success" for message in current_tools):
+        answer = (
+            "工具已返回结果，但模型没有生成完整解读。可以打开「查看执行记录」查看结果。" if chinese else
+            "The tools returned results. Open the execution record for details because the model reply was incomplete."
+        )
+        # Only summarize the ranking directly when it is the sole computation to report.
+        computations = [message for message in current_tools if message.name in NUMERIC_TOOLS]
+        if len(computations) == 1 and computations[0].status == "success":
+            ranking = (computations[0].artifact or {}).get("relationship_ranking")
+            if ranking and (ranking["numeric"] or ranking["categorical"]):
+                return AIMessage(content=ranking_summary(ranking, chinese=chinese, demo=demo))
+    elif current_tools:
+        answer = (
+            "本轮没有得到可用的工具结果，模型也没有生成完整回答。可以打开「查看执行记录」查看错误。" if chinese else
+            "The tools did not return usable results and the model reply was incomplete. See the execution record for errors."
+        )
+    else:
+        answer = (
+            "模型没有生成完整回答，本轮没有执行分析。请重试，或开启新对话后再问。" if chinese else
+            "The model did not return a complete reply. This turn ran no analysis. Please retry or start a new chat."
+        )
+    return AIMessage(content=answer)
+
+
+def ranking_summary(ranking: dict, *, chinese: bool, demo: bool) -> str:
+    sections = []
+    if ranking["numeric"]:
+        rows = [f"- `{row['field']}` · Pearson r = {row['r']:+.3f} · n = {row['rows']:,}" for row in ranking["numeric"]]
+        sections.append("\n".join(["**数值字段（按 |r| 排名）**" if chinese else "**Numeric fields (ranked by |r|)**", *rows]))
+    if ranking["categorical"]:
+        rows = [f"- `{row['field']}` · η = {row['eta']:.3f} · n = {row['rows']:,}" for row in ranking["categorical"]]
+        sections.append("\n".join(["**分类字段（按 η 排名）**" if chinese else "**Categorical fields (ranked by η)**", *rows]))
+    if chinese:
+        source = "合成示例数据" if demo else "当前数据"
+        sections.append(f"使用{source}的 {ranking['rows']:,} 行。两类指标各自在对应字段类型内比较，结果仅描述样本中的关联。")
+    else:
+        source = "the synthetic demo" if demo else "the current table"
+        sections.append(f"Results describe associations in the {ranking['rows']:,} rows of {source}. Compare scores within each field type.")
+    return "\n\n".join(sections)
 
 
 def build_analysis_graph(model, context: AnalysisContext):
@@ -264,8 +391,9 @@ def build_analysis_graph(model, context: AnalysisContext):
                 return execute(request)
             writer = request.runtime.stream_writer
             writer({"event": "candidate_review", "stage": "start", "tool": call["name"], "target": args.target_column})
+            fields = list(args.inputs) if call["name"] == "predict_value" else args.candidate_columns
             review = review_candidates(
-                frame, args.target_column, target, args.candidate_columns,
+                frame, args.target_column, target, fields,
                 method=call["name"], confirmed=confirmed_fields(messages),
             )
             writer({"event": "candidate_review", "stage": "reviewed", "tool": call["name"],
@@ -289,7 +417,14 @@ def build_analysis_graph(model, context: AnalysisContext):
             return "request_preview"
         if messages and previous_call_for_confirmation(messages) is not None:
             return "rerun_confirmed"
+        if ranking_chart_requests(messages, working_frame(context, state)):
+            return "chart_ranking"
         return "analyst"
+
+    def chart_ranking(state: AnalysisState):
+        requests = ranking_chart_requests(state["messages"], working_frame(context, state))
+        calls = [{"name": name, "args": args, "id": f"ranking-chart-{uuid4().hex}"} for name, args in requests]
+        return {"messages": [AIMessage(content="", tool_calls=calls)], "tool_turns": 1}
 
     def rerun_confirmed(state: AnalysisState):
         call = previous_call_for_confirmation(state["messages"])
@@ -342,6 +477,14 @@ def build_analysis_graph(model, context: AnalysisContext):
             prompt += "\nThe tool-call budget is exhausted. Summarize completed work and label any gaps."
         history = messages_for_model(state["messages"], state.get("rejected_tool_calls", []))
         response = active_model.invoke([SystemMessage(content=prompt), *history])
+        if not usable_response(response):
+            retry_prompt = (
+                f"{prompt}\nThe preceding attempt was empty or cut off. Give a brief, complete response "
+                "supported by the recorded results. If a requested calculation still needs to run, call its tool."
+            )
+            response = active_model.invoke([SystemMessage(content=retry_prompt), *history])
+            if not usable_response(response):
+                response = fallback_answer(history, demo=context.source.endswith(" (synthetic demo)"))
         return {"messages": [response], "tool_turns": turns + bool(response.tool_calls)}
 
     def validate(state: AnalysisState, runtime: Runtime[AnalysisContext]):
@@ -382,12 +525,14 @@ def build_analysis_graph(model, context: AnalysisContext):
         .add_node("analyst", analyst)
         .add_node("request_preview", request_preview)
         .add_node("rerun_confirmed", rerun_confirmed)
+        .add_node("chart_ranking", chart_ranking)
         .add_node("tools", ToolNode(ANALYSIS_TOOLS, handle_tool_errors=True, wrap_tool_call=guard_preparation))
         .add_node("preview_answer", preview_answer)
         .add_node("validate", validate)
-        .add_conditional_edges(START, entry, ["request_preview", "rerun_confirmed", "analyst"])
+        .add_conditional_edges(START, entry, ["request_preview", "rerun_confirmed", "chart_ranking", "analyst"])
         .add_edge("request_preview", "tools")
         .add_edge("rerun_confirmed", "tools")
+        .add_edge("chart_ranking", "tools")
         .add_conditional_edges("analyst", tools_condition, {"tools": "tools", END: "validate"})
         .add_conditional_edges("tools", after_tools, ["preview_answer", "analyst"])
         .add_conditional_edges("validate", after_validation, ["analyst", END])
@@ -443,7 +588,8 @@ def tool_trace(messages, rejected=()) -> list[dict]:
     batch = 0
     evidence_fields = (
         "row_change", "overview", "profile", "column_values", "relationship_ranking", "feature_importance",
-        "pairwise_correlation", "group_summary", "trend_summary", "distribution_summary", "candidate_review",
+        "pairwise_correlation", "group_summary", "group_distribution", "trend_summary", "distribution_summary",
+        "candidate_review", "prediction_evaluation",
     )
     for message in messages:
         if isinstance(message, AIMessage) and message.tool_calls:

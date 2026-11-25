@@ -9,7 +9,7 @@ from pandas.api.types import is_bool_dtype, is_datetime64_any_dtype, is_numeric_
 
 from .dataset import finite_numbers
 
-CANDIDATE_TOOLS = {"rank_relationships", "feature_importance_report"}
+CANDIDATE_TOOLS = {"rank_relationships", "feature_importance_report", "evaluate_prediction", "predict_value"}
 MIN_PAIRED_ROWS = 3
 CONFIRMATION = re.compile(r"^[ \t]*(?:确认纳入|confirm inclusion of)[ \t]*((?:`[^`\n]+`[ \t,，、]*)+)$", re.I | re.M)
 COLUMN_TOKENS = re.compile(r"[^\w]+|_", re.UNICODE)
@@ -65,7 +65,7 @@ def review_candidates(
     frame: pd.DataFrame, target_column: str, target: pd.Series, candidate_columns: list[str] | None,
     *, method: str, confirmed: set[str],
 ) -> CandidateReview:
-    prediction = method == "feature_importance_report"
+    prediction = method != "rank_relationships"
     names = dict.fromkeys(frame.columns if candidate_columns is None else candidate_columns)
     names.pop(target_column, None)
     target = target.dropna()

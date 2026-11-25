@@ -29,7 +29,8 @@ from src.tools import DATA_PATH, DEFAULT_PREVIEW_ROWS, AnalysisContext, Prepared
 from src.tools.candidates import REASONS, STATUS_LABELS, review_counts
 from src.web_journey import describe_journey
 from src.web_progress import (
-    Activity, activity_for_update, activity_html, describe_call, update_candidate_activity, update_validation_activity,
+    Activity, activity_for_update, activity_html, describe_call, update_candidate_activity,
+    update_prediction_activity, update_validation_activity,
 )
 
 DEMO_QUESTIONS = {
@@ -126,7 +127,8 @@ def analyze(
                 if mode == "values":
                     result = event
                 elif mode == "custom":
-                    if update_candidate_activity(activity, event) or update_validation_activity(activity, event):
+                    if (update_candidate_activity(activity, event) or update_prediction_activity(activity, event)
+                            or update_validation_activity(activity, event)):
                         show_activity(activity)
                 else:
                     for step in activity_for_update(event):
@@ -222,6 +224,8 @@ def show_importance_evidence(evidence: dict):
             f"{evidence['validation_mae']:,.4g}，只猜中位数时为 {evidence['baseline_mae']:,.4g}。"
             f"模型在 {evidence['baseline_wins']}/{folds} 折中误差更低。"
         )
+        if evidence["rows"] < evidence.get("available_rows", evidence["rows"]):
+            st.caption(f"本次从 {evidence['available_rows']:,} 行有效记录中抽样，抽样种子为 {evidence['sample_seed']}。")
         top = evidence["factors"][0]
         st.text(
             f"打乱「{top['field']}」后，验证误差平均增加 {top['mae_increase']:,.4g}。"
@@ -232,11 +236,13 @@ def show_importance_evidence(evidence: dict):
         for factor in evidence["factors"]:
             st.text(f"{factor['field']} · 占比 {factor['share']:.1%} · {factor['positive_folds']}/{folds} 折打乱后误差上升")
         st.caption("占比描述模型在这份数据里的预测依赖。相关字段可能分摊重要性，因果方向和其他数据上的表现需要额外验证。")
+        st.caption("占比的分母是逐列打乱后所有正向的误差增量之和。")
 
 
 def show_candidate_review(review: dict, *, rejected: bool):
     with st.container(border=True):
-        method = "关联排名" if review["method"] == "rank_relationships" else "因素重要性"
+        method = {"rank_relationships": "关联排名", "feature_importance_report": "因素重要性",
+                  "evaluate_prediction": "预测评估", "predict_value": "单条估算"}[review["method"]]
         st.text(f"{method} · 目标字段 {review['target']}")
         counts = review_counts(review)
         status = f"入选 {counts['included']} · 跳过 {counts['excluded']} · 待确认 {counts['needs_confirmation']}"
@@ -337,7 +343,7 @@ def show_turn(turn: Turn):
         if turn.error:
             st.error(turn.error)
             return
-        st.markdown(turn.messages[-1].text or "分析已完成。")
+        st.markdown(turn.messages[-1].text.strip() or "模型没有返回可显示的回复。")
         trace = getattr(turn, "trace", None)
         if trace and (validation := trace.get("validation")):
             last = validation[-1]["status"]
@@ -353,7 +359,8 @@ def show_turn(turn: Turn):
                 show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])
         for report in turn.reports:
             with st.container(border=True):
-                st.image(report.image, caption=report.title, width="stretch")
+                with st.container(key=f"report-image-{Path(report.filename).stem}"):
+                    st.image(report.image, caption=report.title, width="stretch")
                 evidence = getattr(report, "evidence", None)
                 if evidence:
                     show_importance_evidence(evidence)

@@ -54,6 +54,22 @@
     border-radius: 0.6rem;
 }
 
+@media print {
+    [data-testid="stChatMessage"], [data-testid="stChatMessageContent"] {
+        display: block !important;
+    }
+    [class*="st-key-report-image-"] {
+        display: block !important;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    [class*="st-key-report-image-"] [data-testid="stImage"] img {
+        display: block;
+        height: auto;
+        max-width: 100%;
+    }
+}
+
 .agent-activity {
     --workstation-width: clamp(7.75rem, 18vw, 11.5rem);
     --scene-gap: clamp(0.45rem, 1.5vw, 1rem);

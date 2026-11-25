@@ -7,7 +7,7 @@ from langchain.messages import AIMessage
 from streamlit.testing.v1 import AppTest
 
 from src import agent, table_store
-from src.web_progress import Activity, activity_for_update, activity_html
+from src.web_progress import Activity, activity_for_update, activity_html, update_prediction_activity
 from test_agent import ScriptedModel, call_tool
 
 
@@ -40,6 +40,20 @@ def test_progress_combines_simultaneous_tool_calls_and_ignores_result_events():
     mixed = AIMessage(content="", tool_calls=group.tool_calls + filter_call.tool_calls)
     step, = activity_for_update({"analyst": {"messages": [mixed]}})
     assert step.label == "筛选数据" and "Singapore" in step.details[0]
+
+
+def test_prediction_progress_updates_each_stage_in_one_bubble():
+    activity = []
+    event = {"event": "prediction_progress", "target": "price", "tool_call_id": "model", "folds": 3,
+             "rows": 12000, "available_rows": 162691}
+    for stage in ("fit", "importance"):
+        for fold in (1, 2, 3):
+            assert update_prediction_activity(activity, {**event, "stage": stage, "fold": fold})
+    assert update_prediction_activity(activity, {**event, "stage": "chart"})
+    trained, scored, drawing = activity
+    assert "第 3/3 折" in trained.details[0] and "162,691" in trained.details[0]
+    assert "第 3/3 折" in scored.details[0]
+    assert drawing.label == "正在绘制因素重要性图" and drawing.phase == "chart"
 
 
 def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
@@ -108,6 +122,18 @@ def test_browser_previews_actual_rows_and_records_tool_response(monkeypatch):
     }]
 
 
+def test_browser_reports_an_empty_reply_without_claiming_analysis_finished(monkeypatch):
+    model = ScriptedModel([AIMessage(content=""), AIMessage(content="\n")])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.chat_input[0].set_value("和什么相关呢").run()
+    app.run()
+    assert not app.exception
+    assert any("本轮没有执行分析" in item.value for item in app.markdown)
+    assert all("分析已完成" not in item.value for item in app.markdown)
+    assert len(model.prompts) == 2 and app.session_state.turns[0].trace is None
+
+
 def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypatch):
     model = ScriptedModel([
         call_tool("rank_relationships", "rank", target_column="resale_price"),
@@ -131,6 +157,28 @@ def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypa
     review_step, calculate_step, *_ = app.session_state.turns[0].activity
     assert review_step.label == "正在审查候选字段" and "入选 3 个" in review_step.details[-1]
     assert calculate_step.label == "比较字段关联强度"
+
+
+def test_browser_shows_prediction_progress_and_measured_error(monkeypatch):
+    csv = "size,price\n" + "".join(f"{index},{index * 5 + 80}\n" for index in range(60))
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("prices.csv", csv.encode())
+    model = ScriptedModel([
+        call_tool("evaluate_prediction", "prediction", target_column="price"),
+        AIMessage(content="预测误差低于中位数基准。"),
+    ])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    app.chat_input[0].set_value("那我可以预测二手售卖的价格吗？").run()
+    app.run()
+    assert not app.exception
+    turn = app.session_state.turns[0]
+    step, = turn.trace["steps"]
+    assert step["tool"] == "evaluate_prediction" and step["status"] == "success"
+    assert any(item.label == "正在训练并验证" and "随机训练/测试切分" in item.details[0] for item in turn.activity)
+    assert any(item.value == "训练与测试明细" for item in app.caption)
+    assert any("模型 MAE" in item.value and "中位数基准" in item.value for item in app.text)
+    assert not turn.reports
 
 
 def test_browser_keeps_prepared_data_until_restored(monkeypatch):

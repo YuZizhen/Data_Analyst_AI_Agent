@@ -37,6 +37,45 @@ def metric(
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
+def group_distribution_report(
+    group_column: str, value_column: str, runtime: ToolRuntime[AnalysisContext], top_n: int = 12,
+) -> tuple[str, dict]:
+    """Draw box plots comparing the distribution of a numeric value across categories.
+
+    Args:
+        group_column: Exact categorical column name.
+        value_column: Exact numeric column name.
+        top_n: Maximum categories to show, ranked by count (1 to 25).
+    """
+    if not 1 <= top_n <= 25:
+        raise ToolException("top_n must be between 1 and 25.")
+    context = runtime.context
+    frame = working_frame(context, runtime.state)
+    values = numeric_column(frame, value_column)
+    labels = column(frame, group_column).astype("string")
+    valid = labels.notna() & labels.str.strip().ne("") & values.notna()
+    groups = values[valid].groupby(labels[valid], observed=True)
+    counts = groups.size().nlargest(top_n)
+    if counts.empty:
+        raise ToolException("No usable groups for the requested distribution.")
+    shown = [(str(name), groups.get_group(name)) for name in counts.index]
+    summary = [{"group": name, "rows": len(group), "median": float(group.median())} for name, group in shown]
+    title = f"Distribution of {value_column} by {group_column}"
+    subtitle = f"{len(shown)} categories shown | {sum(row['rows'] for row in summary):,} paired rows shown"
+
+    def draw(axes):
+        axes.boxplot([group.to_numpy(dtype=float) for _, group in shown], vert=False, showfliers=False)
+        axes.set_yticks(range(1, len(shown) + 1), [name for name, _ in shown])
+        axes.invert_yaxis()
+        axes.set_xlabel(value_column)
+
+    artifact = render_report(context.output_dir, "group-distribution", title, subtitle,
+                             working_source(context, runtime.state), draw, height=max(5.2, 2.8 + len(shown) * 0.35))
+    artifact["group_distribution"] = {"groups": summary, "rows": int(valid.sum())}
+    return f"PNG report created. {title}. {subtitle}. Categories selected by frequency. Outlier markers are hidden.", artifact
+
+
+@tool(response_format="content_and_artifact", parse_docstring=True)
 def average_by_group(
     group_column: str, value_column: str, top_n: int = 10,
     runtime: ToolRuntime[AnalysisContext] = None,

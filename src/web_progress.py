@@ -14,10 +14,12 @@ class Activity:
     label: str
     phase: str = "review"
     details: tuple[str, ...] = ()
+    tool_call_id: str = ""
 
 
 METRIC_LABELS = {"mean": "平均值", "median": "中位数", "sum": "总和"}
 PERIOD_LABELS = {"day": "天", "week": "周", "month": "月", "quarter": "季度", "year": "年"}
+PREDICTION_MODELS = {"decision_tree": "单棵决策树", "linear_regression": "线性回归", "ridge": "岭回归", "random_forest": "随机森林"}
 FILTER_LABELS = {
     "equals": "等于", "not_equals": "不等于", "in": "属于", "contains": "包含",
     "greater_than": "大于", "at_least": "至少为", "less_than": "小于", "at_most": "至多为",
@@ -90,6 +92,8 @@ def describe_call(name: str, args: dict) -> Activity | None:
             bin_count = f" {bins} 个" if isinstance(bins, int) and 1 <= bins <= 50 else "多个"
             detail = f"把{field_label(value)}分成{bin_count}等宽区间，统计每个区间的行数。"
             return Activity("绘制分布直方图", "chart", (detail,))
+        case "group_distribution_report":
+            return Activity("绘制分组箱线图", "chart", (f"按{field_label(params.get('group_column'))}展示{field_label(value)}的分布。",))
         case "rank_relationships":
             target = field_label(params.get("target_column"))
             candidates = params.get("candidate_columns")
@@ -100,6 +104,10 @@ def describe_call(name: str, args: dict) -> Activity | None:
             target = field_label(params.get("target_column"))
             detail = f"预测{target}，在验证数据上逐列打乱取值，比较误差增量并绘制前 {params.get('top_n')} 个因素的占比。"
             return Activity("绘制因素重要性图", "chart", (detail,))
+        case "evaluate_prediction" | "predict_value":
+            target = field_label(params.get("target_column"))
+            title = "估算单条记录" if name == "predict_value" else "评估预测误差"
+            return Activity(title, details=(f"用留出的记录验证{target}的预测误差，并与中位数基准比较。",))
         case "relationship_report":
             x_column = field_label(params.get("x_column"))
             y_column = field_label(params.get("y_column"))
@@ -110,7 +118,7 @@ def describe_call(name: str, args: dict) -> Activity | None:
 
 def activity_for_update(update):
     for node, state in update.items():
-        if node not in {"analyst", "request_preview"}:
+        if node not in {"analyst", "request_preview", "chart_ranking"}:
             continue
         for message in (state or {}).get("messages", []):
             if not isinstance(message, AIMessage):
@@ -147,6 +155,44 @@ def update_candidate_activity(activity: list[Activity], event: dict) -> bool:
             if activity[index] == Activity(label, details=(scope,)):
                 activity[index] = Activity(label, details=(scope, summary))
                 break
+    return True
+
+
+def update_prediction_activity(activity: list[Activity], event: dict) -> bool:
+    if event.get("event") != "prediction_progress":
+        return False
+    target = field_label(event["target"])
+    phase = "review"
+    match event["stage"]:
+        case "fit":
+            label = "正在训练并验证"
+            method = {"random": "随机训练/测试切分", "chronological": "按时间训练/测试切分"}.get(event.get("split"))
+            step = method or f"第 {event['fold']}/{event['folds']} 折"
+            model = PREDICTION_MODELS.get(event.get("model"))
+            model_detail = f"使用{model}，" if model else ""
+            detail = f"{step}。{model_detail}用留出记录评估{target}的预测误差。"
+            if event.get("sampled", event["rows"] < event["available_rows"]):
+                detail += f"本次从 {event['available_rows']:,} 行有效记录中抽取 {event['rows']:,} 行。"
+        case "importance":
+            label = "正在计算因素重要性"
+            detail = f"第 {event['fold']}/{event['folds']} 折。逐列打乱验证数据，比较误差变化。"
+        case "chart":
+            label = "正在绘制因素重要性图"
+            detail = "根据已计算的误差变化绘制占比图。"
+            phase = "chart"
+        case "refit":
+            label = "正在拟合估算模型"
+            detail = f"交叉验证已完成，用选定样本拟合估算模型以预测{target}。"
+        case _:
+            return False
+    step = Activity(label, phase, (detail,), event["tool_call_id"])
+    for index in range(len(activity) - 1, -1, -1):
+        item = activity[index]
+        if item.tool_call_id == step.tool_call_id and item.label == label:
+            activity[index] = step
+            break
+    else:
+        activity.append(step)
     return True
 
 
