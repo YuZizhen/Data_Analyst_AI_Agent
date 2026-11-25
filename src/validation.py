@@ -17,7 +17,6 @@ NUMERIC_TOOLS = {
     "average_by_group", "group_report", "trend_report", "distribution_report",
     "rank_relationships", "relationship_report", "group_distribution_report", "feature_importance_report", "evaluate_prediction", "predict_value",
 }
-SCOPE_WORDS = re.compile(r"只(?:看|分析|保留|统计|筛选|比较)|仅(?:看|分析|保留|统计)|\bonly (?:rows|records|include|analy[sz]e)", re.I)
 CLAIM = re.compile(r"导致|显著(?:影响|相关|提高|降低)|决定了|证明.{0,10}因果|\bcaus(?:e[ds]?|ally)\b|statistically significant", re.I)
 RANK_OVERCLAIM = re.compile(r"(?:最为?显著|影响(?:最强|最大)|most significant|greatest impact)", re.I)
 IMPORTANCE_OVERCLAIM = re.compile(
@@ -41,26 +40,72 @@ def check(label: str, status: str, detail: str, *, tool: str = "") -> dict:
     return {"label": label, "status": status, "detail": detail, "tool": tool}
 
 
-def explicit_scope(question: str, columns) -> list[tuple[str, str]]:
-    filters = []
-    for name in sorted(columns, key=len, reverse=True):
-        field = rf"(?<![a-zA-Z0-9_])(?:`{re.escape(name)}`|{re.escape(name)})"
-        pattern = rf"{field}\s*(?:==|=|等于)\s*(?:\"([^\"]+)\"|'([^']+)'|「([^」]+)」|([^,，。；;\n]+))"
-        if match := re.search(pattern, question, re.I):
-            value = match[1] or match[2] or match[3]
-            if value is None:
-                value = re.split(r"然后|再按|再算|再画|\s+(?:then|before)\b", match[4], maxsplit=1, flags=re.I)[0]
-                value = value.strip().rstrip("?？。.")
-            if value:
-                filters.append((name, value))
-    return filters
-
-
 def replay_scope(source: pd.DataFrame, scope: dict) -> pd.DataFrame:
     frame = source
     for step in scope["steps"]:
         frame = PREPARATION_FUNCTIONS[step["tool"]](frame, **step["parameters"])
     return frame
+
+
+def verify_requested_scope(source, frame, steps, inherited, request, tool, supplied_values):
+    checks = []
+    conditions = [item for item in request["conditions"] if item["source"] != "record_input"]
+    unresolved = request["unresolved"]
+    if unresolved:
+        phrases = "、".join(f"「{item}」" for item in unresolved)
+        checks.append(check("问题的筛选条件", "limited", f"以下条件未能完整映射为可核对的筛选规则：{phrases}。", tool=tool))
+    initial = [] if request["reset"] else inherited
+    prefix = len(initial) if steps[:len(initial)] == initial else 0
+    actual = [step["parameters"] for step in steps if step["tool"] == "filter_rows"]
+    comparison = {"requested": conditions, "actual": actual, "unresolved": unresolved, "actual_rows": len(frame)}
+    if prefix:
+        comparison["inherited"] = [step["parameters"] for step in steps[:prefix] if step["tool"] == "filter_rows"]
+    new_filters = any(step["tool"] == "filter_rows" for step in steps[prefix:])
+    if new_filters and not conditions and not unresolved and not request["reset"]:
+        checks.append(check("请求与执行范围", "limited", "工具执行了新的筛选，但从用户原话未能独立确认这些筛选条件。", tool=tool))
+    if supplied_values:
+        comparison["prediction_inputs"] = supplied_values
+
+    for item in conditions:
+        field, operator, value = item["column_name"], item["operator"], item["value"]
+        try:
+            matching = len(filter_frame(frame, field, operator, value))
+        except ToolException:
+            checks.append(check("问题的筛选条件", "limited", f"无法按当前字段类型核对「{item['phrase']}」。", tool=tool))
+            continue
+        valid = matching == len(frame)
+        checks.append(check("问题的筛选条件", "passed" if valid else "failed",
+                            f"工具收到的 {len(frame):,} 行中，有 {matching:,} 行满足「{item['phrase']}」"
+                            f"（{field} {operator} {value}）。", tool=tool))
+
+    if not unresolved and not any(item["status"] == "limited" for item in checks):
+        try:
+            expected = replay_scope(source, {"steps": initial})
+            current = [step for step in steps[prefix:] if step["tool"] != "filter_rows"]
+            conversions = [step for step in current if step["tool"] == "convert_column"]
+            expected = replay_scope(expected, {"steps": conversions})
+            for item in conditions:
+                expected = filter_frame(expected, item["column_name"], item["operator"], item["value"])
+            expected = replay_scope(expected, {"steps": [step for step in current if step["tool"] != "convert_column"]})
+            missing = len(expected.index.difference(frame.index))
+            extra = len(frame.index.difference(expected.index))
+            comparison.update(expected_rows=len(expected), missing_rows=missing, extra_rows=extra)
+            duplicated = any(step["tool"] == "drop_duplicates" for step in current)
+            if duplicated and (missing or extra):
+                status = "limited"
+                detail = "去重和筛选的顺序影响了保留的行，暂无法完整确认范围。"
+            else:
+                status = "failed" if missing or extra else "passed"
+                detail = f"按请求应使用 {len(expected):,} 行，实际使用 {len(frame):,} 行。漏掉 {missing:,} 行，多纳入 {extra:,} 行。"
+            checks.append(check("请求与执行范围", status, detail, tool=tool))
+        except (KeyError, ToolException, TypeError, ValueError):
+            checks.append(check("请求与执行范围", "limited", "无法结合已记录的清洗步骤重建完整的请求范围。", tool=tool))
+    if not checks:
+        checks.append(check("请求与执行范围", "limited", "没有足够信息核对筛选范围。", tool=tool))
+    statuses = {item["status"] for item in checks}
+    comparison["status"] = "failed" if "failed" in statuses else "limited" if "limited" in statuses else "passed"
+    checks[-1]["scope_comparison"] = comparison
+    return checks
 
 
 def check_groups(frame: pd.DataFrame, args: dict, evidence: dict) -> tuple[bool, str]:
@@ -127,10 +172,10 @@ RECOMPUTE = {
 }
 
 
-def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejected: set[str], recovery_start: int, emit) -> tuple[list[dict], set[str]]:
+def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejected: set[str], recovery_start: int, emit,
+                     *, request_scope: dict, input_preparation: list[dict]) -> tuple[list[dict], set[str]]:
     user = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), -1)
     current = messages[user + 1:]
-    question = messages[user].text if user >= 0 else ""
     calls = {call["id"]: call for item in current if isinstance(item, AIMessage) for call in item.tool_calls}
     tools = [
         msg for msg in current if isinstance(msg, ToolMessage) and msg.name in NUMERIC_TOOLS
@@ -149,13 +194,11 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
     checks, invalid = [], set()
     for name in sorted(needs_replacement):
         checks.append(check("重试结果", "failed", "上次的结果已被排除，本次还没有新的成功计算可核对。", tool=name))
-    conditions = explicit_scope(question, source.columns)
     emit("scope")
     evidence_to_check = []
     for tool in tools:
         evidence = tool.artifact or {}
         supplied_values = evidence.get("prediction_evaluation", {}).get("estimate", {}).get("inputs", {})
-        training_conditions = [(field, value) for field, value in conditions if field not in supplied_values]
         scope = evidence.get("analysis_scope")
         if scope is None:
             checks.append(check("数据范围", "limited", "这次调用缺少可核对的数据范围记录。", tool=tool.name))
@@ -174,18 +217,10 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
         if prediction:
             scope_detail += f"报告中的预测评估使用其中 {prediction['rows']:,} 行。"
         checks.append(check("数据范围", "passed", scope_detail, tool=tool.name))
-        if not training_conditions and SCOPE_WORDS.search(question):
-            checks.append(check("问题的筛选条件", "limited", "这轮包含范围限制。独立核对支持明确写出的字段等值条件。", tool=tool.name))
-        for field, value in training_conditions:
-            try:
-                matching = len(filter_frame(frame, field, "equals", value))
-            except ToolException:
-                matching = 0
-            valid = matching == len(frame) and bool(len(frame))
-            checks.append(check("问题的筛选条件", "passed" if valid else "failed",
-                                f"工具收到的 {len(frame):,} 行中，有 {matching:,} 行满足「{field} = {value}」。", tool=tool.name))
-            if not valid:
-                invalid.add(tool.tool_call_id)
+        scope_checks = verify_requested_scope(source, frame, scope["steps"], input_preparation, request_scope, tool.name, supplied_values)
+        checks.extend(scope_checks)
+        if any(item["status"] == "failed" for item in scope_checks):
+            invalid.add(tool.tool_call_id)
         evidence_to_check.append((tool, evidence, frame))
     emit("numbers")
     for tool, evidence, frame in evidence_to_check:

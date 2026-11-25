@@ -1,5 +1,6 @@
 """Exercise the LangGraph tool loop and PNG reports without API credentials."""
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_artifacts, tool_trace
+from src.request_scope import ScopeLabels, parse_request_scope, resolve_observed_labels
 from src.tools import charts, predictions
 
 
@@ -425,6 +427,110 @@ def test_validation_rejects_chart_for_wrong_scope_and_retries_once(tmp_path, rec
     else:
         assert all("path" not in artifact for artifact in artifacts)
         assert "校验未通过" in result["messages"][-1].text
+
+
+@pytest.mark.parametrize("scope", ["market = Singapore、实习", "market = Singapore、employment = Internship", "新加坡的实习岗位"])
+def test_validation_catches_an_omitted_internship_filter(tmp_path, scope):
+    csv = tmp_path / "jobs.csv"
+    pd.DataFrame({"market": ["Singapore"] * 12 + ["Malaysia"] * 2,
+                  "employment": ["Internship"] * 4 + ["Full-time"] * 8 + ["Internship"] * 2,
+                  "category": ["Support"] * 14, "pay": [20] * 4 + [80] * 8 + [100] * 2}).to_csv(csv, index=False)
+    model = ScriptedModel([
+        call_tool("filter_rows", "market", column_name="market", operator="equals", value="Singapore"),
+        call_tool("group_report", "wrong", group_column="category", value_column="pay"),
+        AIMessage(content="平均薪资是 60。"),
+        call_tool("filter_rows", "employment", column_name="employment", operator="equals", value="Internship"),
+        call_tool("group_report", "right", group_column="category", value_column="pay"),
+        AIMessage(content="实习岗位的平均薪资是 20。"),
+    ])
+
+    class ScopeInterpreter:
+        def invoke(self, prompt):
+            data = json.loads(prompt.split("\n", 1)[1])
+            choices = {item["value"]: item["id"] for item in data["observed_choices"]}
+            clauses = []
+            for phrase in data["unresolved_phrases"]:
+                selected = [choices["Internship"]]
+                if "新加坡" in phrase:
+                    selected.insert(0, choices["Singapore"])
+                clauses.append({"phrase": phrase, "choices": selected})
+            return ScopeLabels(clauses=clauses)
+
+    model.with_structured_output = lambda schema: ScopeInterpreter()
+    result = build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content=f"只看{scope}，按 category 画 pay 的均值图。"),
+    ]})
+    assert [record["status"] for record in result["validation"]] == ["failed", "passed"]
+    first, second = [next(c["scope_comparison"] for c in attempt["checks"] if "scope_comparison" in c)
+                     for attempt in result["validation"]]
+    assert [item["value"] for item in first["requested"]] == ["Singapore", "Internship"]
+    assert len(first["actual"]) == 1 and first["actual_rows"] == 12 and first["extra_rows"] == 8
+    assert len(second["actual"]) == 2 and second["actual_rows"] == second["expected_rows"] == 4
+    assert result["rejected_tool_calls"] == ["wrong"]
+
+
+def test_scope_resolves_a_new_domain_using_only_observed_values():
+    table = pd.DataFrame({"material": ["Copper", "Aluminum"], "area": ["North", "South"]})
+    question = "只看 material = Copper、北部，画图。"
+    parsed = parse_request_scope(question, table)
+    assert parsed["unresolved"] == ["北部"]
+
+    def match_label(prompt):
+        data = json.loads(prompt.split("\n", 1)[1])
+        choice, = [item for item in data["observed_choices"] if item["value"] == "North"]
+        return ScopeLabels(clauses=[{"phrase": "北部", "choices": [choice["id"]]}])
+
+    resolved = resolve_observed_labels(question, parsed, table, match_label)
+    assert resolved["conditions"][-1] == {"column_name": "area", "value": "North", "operator": "equals",
+                                         "phrase": "北部", "source": "model_label_match"}
+    assert not resolved["unresolved"]
+    ungrounded = resolve_observed_labels(question, parsed, table,
+                                        lambda _: ScopeLabels(clauses=[{"phrase": "北部", "choices": [999]}]))
+    assert ungrounded == parsed
+
+
+def test_scope_is_partial_if_part_of_the_request_is_unresolved(tmp_path):
+    model = ScriptedModel([
+        call_tool("filter_rows", "town", column_name="town", operator="equals", value="BISHAN"),
+        call_tool("group_report", "chart", group_column="town", value_column="resale_price"),
+        AIMessage(content="均价 820000。"),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="只看 town = BISHAN、靠近地铁的房源，画均价图。"),
+    ]})
+    attempt, = result["validation"]
+    assert attempt["status"] == "limited"
+    assert result["request_scope"]["unresolved"] == ["靠近地铁的房源"]
+    assert any(item["label"] == "独立复算" and item["status"] == "passed" for item in attempt["checks"])
+
+
+def test_scope_parser_preserves_quoted_delimiters_and_marks_alternatives():
+    table = pd.DataFrame({"sector": ["Finance、Banking"], "market": ["Singapore"]})
+    exact = parse_request_scope('只看 sector = "Finance、Banking"、market = Singapore，画图。', table)
+    assert [(rule["column_name"], rule["value"]) for rule in exact["conditions"]] == [
+        ("sector", "Finance、Banking"), ("market", "Singapore"),
+    ]
+    assert not exact["unresolved"]
+    alternative = parse_request_scope("只看 market = Singapore 或 Malaysia，画图。", table)
+    assert not alternative["conditions"] and alternative["unresolved"]
+
+
+def test_scope_rejects_a_subgroup_even_if_every_retained_row_matches(tmp_path):
+    model = ScriptedModel([
+        call_tool("filter_rows", "town", column_name="town", operator="equals", value="BISHAN"),
+        call_tool("filter_rows", "extra", column_name="resale_price", operator="greater_than", value=800000),
+        call_tool("group_report", "chart", group_column="town", value_column="resale_price"),
+        AIMessage(content="均价 850000。"),
+        AIMessage(content="没有新的计算。"),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="只看 town = BISHAN，画均价图。"),
+    ]})
+    attempt, _ = result["validation"]
+    scope = next(item["scope_comparison"] for item in attempt["checks"] if "scope_comparison" in item)
+    assert (scope["actual_rows"], scope["expected_rows"], scope["missing_rows"], scope["extra_rows"]) == (1, 2, 1, 0)
+    assert result["rejected_tool_calls"] == ["chart"]
+    assert result.get("prepared") is None
 
 
 def test_validation_retries_causal_wording_without_recomputing_tool_calls(tmp_path):

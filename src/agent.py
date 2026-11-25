@@ -1,6 +1,7 @@
 """LangGraph workflow and CLI for natural-language CSV analysis."""
 
 import argparse
+import json
 import os
 import re
 from pathlib import Path
@@ -47,6 +48,7 @@ from src.tools import (
 )
 from src.tools.candidates import CONFIRMATION, CANDIDATE_TOOLS, confirmed_fields, review_candidates, review_counts, review_summary
 from src.tools.dataset import numeric_column
+from src.request_scope import ScopeLabels, parse_request_scope, resolve_observed_labels
 from src.validation import NUMERIC_TOOLS, analysis_scope, frame_signature, validate_results
 
 load_dotenv()
@@ -177,6 +179,9 @@ class AnalysisState(AnalysisInput):
     validation: list[dict]
     rejected_tool_calls: list[str]
     recovery_start: int
+    request_scope: dict
+    input_preparation: list[dict]
+    input_working_table: PreparedDataset | None
 
 
 def messages_for_model(messages, rejected=()):
@@ -410,6 +415,23 @@ def build_analysis_graph(model, context: AnalysisContext):
             result = result.model_copy(update={"artifact": {**(result.artifact or {}), "analysis_scope": scope}})
         return result
 
+    def read_request(state: AnalysisState, runtime: Runtime[AnalysisContext]):
+        question = next((message.text for message in reversed(state["messages"]) if isinstance(message, HumanMessage)), "")
+        prepared = state.get("prepared")
+        frame = working_frame(runtime.context, state)
+        scope = parse_request_scope(question, frame)
+        if prepared is not None and scope["reset"]:
+            frame = runtime.context.dataset
+            scope = parse_request_scope(question, frame)
+        if scope["unresolved"] and not scope["has_alternatives"] and hasattr(model, "with_structured_output"):
+            try:
+                scope = resolve_observed_labels(question, scope, frame, model.with_structured_output(ScopeLabels).invoke)
+            except (*MODEL_ERRORS, NotImplementedError, ValueError):
+                # The unresolved phrases remain visible as partial coverage.
+                pass
+        return {"request_scope": scope,
+                "input_preparation": list(prepared.steps) if prepared else [], "input_working_table": prepared}
+
     def entry(state: AnalysisState):
         messages = state["messages"]
         message = messages[-1] if messages else None
@@ -462,6 +484,14 @@ def build_analysis_graph(model, context: AnalysisContext):
         if prepared := state.get("prepared"):
             details = "\n".join(step["detail"] for step in prepared.steps[-8:])
             prompt += f"\nRecent active preparation steps:\n{details}"
+        scope = state["request_scope"]
+        if scope["conditions"] or scope["unresolved"]:
+            prompt += (
+                "\nParsed request conditions (verify against the user question and dataset before applying):\n"
+                f"{json.dumps(scope, ensure_ascii=False)}\n"
+                "Apply each requested row filter before analyzing or plotting. For a single-record estimate, "
+                "treat supplied feature values as inputs, and keep any separate training-scope filters."
+            )
         if validation := state.get("validation"):
             failures = [item for item in validation[-1]["checks"] if item["status"] == "failed"]
             feedback = "\n".join(f"- {item['tool']} {item['label']}: {item['detail']}" for item in failures)
@@ -492,6 +522,7 @@ def build_analysis_graph(model, context: AnalysisContext):
         checks, invalid = validate_results(
             runtime.context.dataset, state["messages"], tool_parameters, rejected, state.get("recovery_start", 0),
             lambda stage: runtime.stream_writer({"event": "validation", "stage": stage}),
+            request_scope=state["request_scope"], input_preparation=state["input_preparation"],
         )
         if not checks:
             return {}
@@ -508,6 +539,9 @@ def build_analysis_graph(model, context: AnalysisContext):
                 update["recovery_start"] = len(state["messages"]) - 1
                 runtime.stream_writer({"event": "validation", "stage": "retry"})
             else:
+                if any(item.get("scope_comparison", {}).get("status") == "failed"
+                       for record in update["validation"] for item in record["checks"]):
+                    update["prepared"] = state["input_working_table"]
                 question = next((message.text for message in reversed(state["messages"]) if isinstance(message, HumanMessage)), "")
                 if re.search(r"[\u3400-\u9fff]", question):
                     answer = "本轮校验未通过，暂时无法给出可靠结论。可以在执行记录的「校验结果」查看具体问题。"
@@ -522,6 +556,7 @@ def build_analysis_graph(model, context: AnalysisContext):
 
     graph = (
         StateGraph(AnalysisState, context_schema=AnalysisContext, input_schema=AnalysisInput)
+        .add_node("read_request", read_request)
         .add_node("analyst", analyst)
         .add_node("request_preview", request_preview)
         .add_node("rerun_confirmed", rerun_confirmed)
@@ -529,7 +564,8 @@ def build_analysis_graph(model, context: AnalysisContext):
         .add_node("tools", ToolNode(ANALYSIS_TOOLS, handle_tool_errors=True, wrap_tool_call=guard_preparation))
         .add_node("preview_answer", preview_answer)
         .add_node("validate", validate)
-        .add_conditional_edges(START, entry, ["request_preview", "rerun_confirmed", "chart_ranking", "analyst"])
+        .add_edge(START, "read_request")
+        .add_conditional_edges("read_request", entry, ["request_preview", "rerun_confirmed", "chart_ranking", "analyst"])
         .add_edge("request_preview", "tools")
         .add_edge("rerun_confirmed", "tools")
         .add_edge("chart_ranking", "tools")

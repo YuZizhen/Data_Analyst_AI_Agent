@@ -163,6 +163,7 @@ def analyze(
                 "question": question,
                 "model": {"provider": provider, "name": model_name},
                 "input_table": {"label": dataset.selected.label, "rows": len(dataset.frame), "columns": len(dataset.frame.columns)},
+                "request_scope": result["request_scope"],
                 "steps": steps,
             }
             if validation := result.get("validation"):
@@ -319,6 +320,17 @@ def show_execution_record(turn: Turn, trace: dict):
                             method = f"{tool.label} · " if tool else ""
                             st.text(f"{method}{item['label']} · {VALIDATION_STATUSES[item['status']]}")
                             st.caption(item["detail"])
+                            if scope := item.get("scope_comparison"):
+                                for label, key, empty in (
+                                    ("请求的筛选", "requested", "本轮未识别到可核对的新增条件"),
+                                    ("实际生效的筛选", "actual", "无"),
+                                ):
+                                    rules = [
+                                        describe_call("filter_rows", condition).details[0]
+                                        + (f"（匹配原话「{condition['phrase']}」）" if condition.get("source") == "model_label_match" else "")
+                                        for condition in scope[key]
+                                    ]
+                                    st.text(f"{label}\n" + ("\n".join(f"• {rule}" for rule in rules) or empty))
                         if attempt["retrying"]:
                             st.caption("已根据这次校验的发现发起重试。")
         with tabs["原始工具数据"]:
@@ -354,6 +366,11 @@ def show_turn(turn: Turn):
             }[last]
             retry_note = " · 已重试一次" if len(validation) > 1 else ""
             render(f"{label}{retry_note}")
+            if last == "passed":
+                st.caption("已核对可识别的筛选范围、受支持的统计量和常见结论措辞。")
+            elif last == "limited" and any(check.get("scope_comparison", {}).get("status") == "limited"
+                                          for check in validation[-1]["checks"]):
+                st.caption("筛选范围只核对了一部分。打开「校验结果」查看哪些条件尚待确认。")
         for artifact in tool_artifacts(turn.messages):
             if "table" in artifact:
                 show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])

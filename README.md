@@ -125,7 +125,7 @@ When validation runs, the progress bubble shows **正在校验**. Open **查看�
 
 | Check | Current coverage |
 | --- | --- |
-| Data scope | Replays recorded cleaning and filters, compares the rebuilt table with the input used by the tool, and checks explicit conditions such as `market = Singapore`. |
+| Data scope | Records requested conditions separately from executed filters. Replays cleaning and compares the actual rows with the requested scope. Explicit comparisons and existing category labels can be matched directly. For unresolved phrases, the model can map translations or synonyms to observed category values in the active data, and the record shows the phrase and matched value. A clause that cannot be resolved is marked as partial coverage. |
 | Independent recalculation | Recomputes grouped statistics, pairwise Pearson correlations, and the median and range of distributions. Trends, field association rankings, and feature importance have partial coverage. |
 | Conclusion wording | Scans the draft for common unsupported causal or statistical significance claims. This is a wording check. Cross-checking every number stated in the answer is on the backlog. |
 
@@ -145,7 +145,7 @@ python -m pytest -q
 
 ## Backlog
 
-1. Extend independent recalculation to relationship rankings, trends, and feature importance. Expand scope checks beyond explicit field equality and compare stated numerical claims with structured results.
+1. Extend independent recalculation to relationship rankings, trends, and feature importance. Expand scope checks to complex conditions such as alternatives and relative dates, and compare stated numerical claims with structured results.
 2. Replay recorded tool calls against a CSV with the matching SHA-256 hash, without calling a model, and compare the results.
 3. Add regression cases for scope selection, numerical accuracy, and conclusions that overstate the evidence.
 

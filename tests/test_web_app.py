@@ -80,6 +80,8 @@ def test_browser_chat_keeps_context_and_resets_on_provider_change(monkeypatch):
     assert any(item.label == "校验结果" for item in app.tabs)
     assert any(item.value == "校验通过" for item in app.success)
     assert any("用 Python 逐组重算了" in item.value for item in app.caption)
+    assert any("请求的筛选" in item.value for item in app.text)
+    assert any("实际生效的筛选" in item.value for item in app.text)
     assert app.session_state.turns[0].trace["validation"][0]["status"] == "passed"
 
     app.chat_input[0].set_value("上一轮图里最高的数值是多少？").run()
