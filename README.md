@@ -52,18 +52,18 @@ The execution record opens to **分析旅程**, which explains the purpose, para
 
 While an answer is running, an animated analyst types at a workstation and the current action appears in a thought bubble. Each bubble describes the selected analysis, including its fields and parameters. Meaningful steps move into the conversation history, while the initial waiting cue disappears. Browser reduced-motion preferences disable the animations.
 
-The sidebar's **当前使用的数据表** selector lists uploaded originals and saved cleaned versions. Successful preparation creates or reuses a version and selects it for follow-up questions. The originals and versions are stored locally as Parquet under `data/private/datasets/`, which is excluded from Git. Manual table or model-provider changes start a new conversation. The **恢复原始数据** button selects the original table. The last four exchanges provide chat context within a conversation.
+The sidebar's **当前使用的数据表** selector lists uploaded originals and explicitly saved versions. Filters and cleaning affect the current conversation's working table and are available for follow-up questions. **清除临时范围** returns to the selected table, and a new conversation clears the temporary scope. To keep a version, use **保存当前范围为数据版本** or ask **保存当前数据表** in chat. Saved row-only selections are labeled **筛选版**, while versions with cleaning steps are labeled **清洗版**. The originals and saved versions are stored locally as Parquet under `data/private/datasets/`, which is excluded from Git. The **恢复原始数据** button selects the original table. The last four exchanges provide chat context within a conversation.
 
-For a cleaned version, open **清洗逻辑与代码** to see each operation, its parameters and row counts, a replay script for the saved original, the actual Python implementations, and a CSV download. Run the replay script from the project environment. It writes a separate output file.
+For a saved version, open **筛选逻辑与代码** or **清洗逻辑与代码** to see the operations, parameters, row counts, replay script, Python implementations, and CSV download. Run the replay script from the project environment. It writes a separate output file.
 
 ### Try it with the demo CSV
 
-Use the original demo table for each example. The filtering example saves and selects a filtered version.
+Use the original demo table for each example. Clear the temporary scope after the filtering example to return to all rows.
 
 | Ask in the chat | What to look for |
 | --- | --- |
 | 我可以看一下这个数据库吗？ | A preview of the active table in the chat. |
-| 只看 `town = BISHAN`，按 `town` 画 `resale_price` 的均价图。 | A saved filtered table, a chart, and a validation record showing how many rows matched and the independently recomputed mean. |
+| 只看 `town = BISHAN`，按 `town` 画 `resale_price` 的均价图。 | A temporary filtered scope, a chart, and a validation record showing how many rows matched and the independently recomputed mean. |
 | 哪些字段与 `resale_price` 的关联最强？ | Candidate review followed by separate numeric and categorical rankings, with sample sizes and a partial validation status. |
 
 ### Command-line interface

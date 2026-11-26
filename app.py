@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -11,7 +12,7 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 import pyarrow as pa
 import streamlit as st
-from langchain.messages import AnyMessage, HumanMessage
+from langchain.messages import AIMessage, AnyMessage, HumanMessage
 
 from src.agent import (
     MODEL_ERRORS,
@@ -40,6 +41,15 @@ DEMO_QUESTIONS = {
 }
 CONTEXT_TURNS = 4
 VALIDATION_STATUSES = {"passed": "通过", "limited": "部分覆盖", "failed": "未通过"}
+SAVE_TABLE_TARGET = r"(?:(?:当前|这个|这份|筛选后(?:的)?|清洗后(?:的)?)\s*)*(?:数据(?:表)?|范围|结果表|筛选结果|清洗结果|筛选版|清洗版)"
+SAVE_TABLE_VERSION = r"\s*(?:为|成)\s*(?:一个)?(?:新(?:的)?(?:版本|数据表|表)|筛选版|清洗版)"
+SAVE_TABLE_REQUEST = re.compile(
+    rf"(?:请\s*)?(?:保存\s*{SAVE_TABLE_TARGET}(?:{SAVE_TABLE_VERSION})?|(?:保存|另存){SAVE_TABLE_VERSION}"
+    rf"|(?:把|将)\s*{SAVE_TABLE_TARGET}\s*保存(?:{SAVE_TABLE_VERSION})?)"
+    r"|(?:please\s+)?save\s+(?:(?:this|the|current|filtered|cleaned|working)\s+)*(?:data\s+table|dataset|table|selection)(?:\s+as\s+a\s+new\s+(?:table|version))?",
+    re.IGNORECASE,
+)
+SAVE_TABLE_SUFFIX = re.compile(r"[,，。；;]\s*(?:并且?|然后|再)?\s*|(?:\s+and\s+(?:then\s+)?|并且?|然后|再)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -103,13 +113,49 @@ def select_dataset(store: TableStore) -> Dataset:
     return dataset
 
 
+def working_table(dataset: Dataset) -> PreparedDataset | None:
+    selected = PreparedDataset(dataset.frame, dataset.selected.steps) if dataset.selected.steps else None
+    return st.session_state.get("working_table", selected)
+
+
+def save_working_table(store: TableStore, dataset: Dataset, prepared: PreparedDataset, provider: str) -> SavedTable:
+    saved = store.save_prepared(dataset.original, prepared)
+    st.session_state.select_table_next = saved.key
+    st.session_state.scope = (saved.key, provider)
+    st.session_state.pop("working_table", None)
+    return saved
+
+
+def split_save_request(question: str) -> tuple[str, bool]:
+    text = question.strip().rstrip("。.!！?？").rstrip()
+    if SAVE_TABLE_REQUEST.fullmatch(text):
+        return "", True
+    for separator in SAVE_TABLE_SUFFIX.finditer(text):
+        if SAVE_TABLE_REQUEST.fullmatch(text[separator.end():]):
+            return text[:separator.start()].strip(), True
+    return question, False
+
+
 def analyze(
     question: str, dataset: Dataset, store: TableStore, provider: str, model_name: str, api_key: str,
     show_activity: Callable[[list[Activity]], None],
 ) -> Turn:
     activity: list[Activity] = []
-    show_activity([Activity("正在查看问题和数据字段")])
+    analysis_question, save_requested = split_save_request(question)
+    prepared_before = working_table(dataset)
+    chinese = bool(re.search(r"[\u3400-\u9fff]", question))
     try:
+        if save_requested and not analysis_question:
+            if prepared_before is None or prepared_before.steps == dataset.selected.steps:
+                answer = ("当前没有尚未保存的筛选或清洗结果。" if chinese
+                          else "There is no unsaved selection or cleaned data in the current scope.")
+            else:
+                saved = save_working_table(store, dataset, prepared_before, provider)
+                answer = (f"已保存「{saved.label}」，可以在侧边栏选择。" if chinese
+                          else f"Saved {saved.label}. You can select it in the sidebar.")
+            return Turn(question, [HumanMessage(content=question), AIMessage(content=answer)])
+
+        show_activity([Activity("正在查看问题和数据字段")])
         model_name = model_name.strip() or default_model_name(provider)
         model = build_model(provider, model_name, api_key=api_key.strip())
         recent = [turn for turn in st.session_state.turns if turn.messages][-CONTEXT_TURNS:]
@@ -117,11 +163,10 @@ def analyze(
             message for turn in recent
             for message in messages_for_model(turn.messages, (turn.trace or {}).get("rejected_tool_calls", []))
         ]
-        prepared_before = PreparedDataset(dataset.frame, dataset.selected.steps) if dataset.selected.steps else None
         with TemporaryDirectory(prefix="analyst-") as directory:
             context = AnalysisContext(dataset.source_frame, dataset.original.name, Path(directory).resolve())
             graph = build_analysis_graph(model, context)
-            inputs = {"messages": [*history, HumanMessage(content=question)], "prepared": prepared_before}
+            inputs = {"messages": [*history, HumanMessage(content=analysis_question)], "prepared": prepared_before}
             result = inputs
             for mode, event in graph.stream(inputs, stream_mode=["updates", "values", "custom"]):
                 if mode == "values":
@@ -144,12 +189,32 @@ def analyze(
                     reports.append(Report(artifact["title"], path.name, path.read_bytes(), artifact.get("feature_importance")))
         steps = tool_trace(messages, rejected)
         prepared_after = result.get("prepared")
-        active_after = dataset.original
-        if prepared_after is not None:
-            active_after = store.save_prepared(dataset.original, prepared_after)
-        if active_after.key != dataset.selected.key:
-            st.session_state.select_table_next = active_after.key
-            st.session_state.scope = (active_after.key, provider)
+        input_frame = prepared_before.frame if prepared_before is not None else dataset.source_frame
+        input_label = dataset.selected.label
+        if "working_table" in st.session_state:
+            input_label += " · 临时分析范围"
+        output_frame = prepared_after.frame if prepared_after is not None else dataset.source_frame
+        before_steps = list(prepared_before.steps) if prepared_before is not None else []
+        after_steps = list(prepared_after.steps) if prepared_after is not None else []
+        temporary = after_steps != list(dataset.selected.steps)
+        saved = None
+        if save_requested:
+            validation = result.get("validation", [])
+            latest_tools = {step["tool"]: step["status"] for step in steps if not step.get("deferred")}
+            ready = bool(steps) and "error" not in latest_tools.values() and (
+                not validation or validation[-1]["status"] != "failed"
+            ) and not result["request_scope"]["unresolved"]
+            if ready and temporary and prepared_after is not None:
+                saved = save_working_table(store, dataset, prepared_after, provider)
+                status = f"已保存「{saved.label}」。" if chinese else f"Saved {saved.label}."
+            else:
+                status = "本轮没有可保存的新版本。" if chinese else "This analysis did not produce a new version to save."
+            messages[-1] = AIMessage(content=f"{messages[-1].text}\n\n{status}", id=messages[-1].id)
+        if saved is None:
+            if temporary:
+                st.session_state.working_table = prepared_after
+            else:
+                st.session_state.pop("working_table", None)
         trace = None
         if steps:
             trace = {
@@ -162,7 +227,7 @@ def analyze(
                 },
                 "question": question,
                 "model": {"provider": provider, "name": model_name},
-                "input_table": {"label": dataset.selected.label, "rows": len(dataset.frame), "columns": len(dataset.frame.columns)},
+                "input_table": {"label": input_label, "rows": len(input_frame), "columns": len(input_frame.columns)},
                 "request_scope": result["request_scope"],
                 "steps": steps,
             }
@@ -172,14 +237,17 @@ def analyze(
                 trace["rejected_tool_calls"] = rejected
             if evidence := [report.evidence for report in reports if report.evidence is not None]:
                 trace["feature_importance"] = evidence
-            if prepared_before is not None or prepared_after is not None:
+            if before_steps or after_steps or temporary:
                 trace["working_data"] = {
-                    "before": list(prepared_before.steps) if prepared_before is not None else [],
-                    "after": list(prepared_after.steps) if prepared_after is not None else [],
-                    "rows_after": active_after.rows,
+                    "before": before_steps,
+                    "after": after_steps,
+                    "rows_after": len(output_frame),
                     "table_before": dataset.selected.key,
-                    "table_after": active_after.key,
+                    "table_after": saved.key if saved else dataset.selected.key,
+                    "temporary": temporary and saved is None,
                 }
+                if saved is not None:
+                    trace["working_data"]["saved_version"] = saved.label
         return Turn(question, messages, reports, trace, activity=activity)
     except MODEL_ERRORS as error:
         if isinstance(error, ConnectionError):
@@ -198,7 +266,8 @@ def show_preview(frame: pd.DataFrame, total_rows: int):
 
 def show_preparation(dataset: Dataset, store: TableStore):
     entry = dataset.selected
-    with st.expander("清洗逻辑与代码"):
+    version_title = "筛选" if entry.filter_only else "清洗"
+    with st.expander(f"{version_title}逻辑与代码"):
         st.caption(f"原表 {dataset.original.rows:,} 行 · 当前版本 {entry.rows:,} 行")
         for index, step in enumerate(entry.steps, start=1):
             action = describe_call(step["tool"], step["parameters"])
@@ -212,8 +281,8 @@ def show_preparation(dataset: Dataset, store: TableStore):
         with source_tab:
             st.code(implementation, language="python")
         st.download_button(
-            "下载清洗版 CSV", dataset.frame.to_csv(index=False).encode("utf-8-sig"),
-            f"cleaned-{entry.key[:10]}.csv", mime="text/csv", key=f"table-csv-{entry.key}", on_click="ignore",
+            f"下载{version_title}版 CSV", dataset.frame.to_csv(index=False).encode("utf-8-sig"),
+            entry.export_name, mime="text/csv", key=f"table-csv-{entry.key}", on_click="ignore",
         )
 
 
@@ -289,6 +358,10 @@ def show_execution_record(turn: Turn, trace: dict):
                 st.text(f"数据来源 · {trace['dataset']['name']}")
             if working := trace.get("working_data"):
                 st.caption(f"本轮结束时的工作表有 {working['rows_after']:,} 行。")
+                if working.get("temporary"):
+                    st.caption("本轮使用临时分析范围，未创建数据版本。")
+                if saved := working.get("saved_version"):
+                    st.caption(f"已保存 {saved}。")
             for number, step in enumerate(journey, start=1):
                 with st.container(border=True):
                     st.markdown(f"**{number}. {step['action']}**")
@@ -432,18 +505,37 @@ def main():
         if st.session_state.get("scope") != scope:
             st.session_state.scope = scope
             st.session_state.turns = []
+            st.session_state.pop("working_table", None)
         st.divider()
         if st.button("新对话", width="stretch", disabled=not st.session_state.turns):
             st.session_state.turns = []
+            st.session_state.pop("working_table", None)
+        prepared = working_table(dataset)
+        frame = prepared.frame if prepared is not None else dataset.source_frame
+        if "working_table" in st.session_state:
+            st.caption(f"当前对话使用临时分析范围 · {len(frame):,} 行")
+            if prepared is not None and st.button("保存当前范围为数据版本", width="stretch"):
+                try:
+                    save_working_table(store, dataset, prepared, provider)
+                except (OSError, ValueError, pa.ArrowException):
+                    st.error("无法保存当前范围。请检查本地工作区。")
+                else:
+                    st.rerun()
+            if st.button("清除临时范围", width="stretch"):
+                st.session_state.pop("working_table", None)
+                st.rerun()
         if dataset.selected.steps and st.button("恢复原始数据", width="stretch"):
             st.session_state.select_table_next = dataset.original.key
             st.session_state.scope = (dataset.original.key, provider)
+            st.session_state.pop("working_table", None)
             st.rerun()
 
     st.title("数据分析工作台", anchor=False)
     st.markdown("用自然语言分析 CSV，生成可下载的图表。")
     with st.expander("预览数据"):
-        show_preview(dataset.frame.head(DEFAULT_PREVIEW_ROWS), len(dataset.frame))
+        if "working_table" in st.session_state:
+            st.caption("预览当前对话的临时分析范围。")
+        show_preview(frame.head(DEFAULT_PREVIEW_ROWS), len(frame))
     if dataset.selected.steps:
         show_preparation(dataset, store)
 

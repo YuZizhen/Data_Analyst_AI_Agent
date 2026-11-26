@@ -215,8 +215,9 @@ def test_browser_renders_the_filtered_rows_and_the_formula_totals(monkeypatch):
     assert any(item.value["category"].tolist() == ["Electronics"] * 4 for item in app.dataframe if "category" in item.value)
     assert "**116.25**" in turn.messages[-1].text
     assert turn.trace["validation"][-1]["status"] == "passed"
+    assert app.selectbox[0].value == entry.key
 
-    app.selectbox[0].set_value(entry.key).run()
+    next(button for button in app.button if button.label == "清除临时范围").click().run()
     app.chat_input[0].set_value("Which category has the highest total revenue? (revenue = units_sold × unit_price × (1 − discount))").run()
     app.run()
     assert not app.exception
@@ -276,7 +277,8 @@ def test_browser_shows_prediction_progress_and_measured_error(monkeypatch):
     assert not turn.reports
 
 
-def test_browser_keeps_prepared_data_until_restored(monkeypatch):
+@pytest.mark.parametrize("save_in_chat", [False, True])
+def test_browser_keeps_temporary_scope_and_saves_only_on_request(monkeypatch, save_in_chat):
     monkeypatch.setenv("MODEL_PROVIDER", "ollama")
     model = ScriptedModel([
         call_tool("filter_rows", "filter", column_name="town", operator="equals", value="bishan"),
@@ -285,26 +287,61 @@ def test_browser_keeps_prepared_data_until_restored(monkeypatch):
     monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
     original_key = app.selectbox[0].value
+    store = table_store.TableStore(table_store.DATASET_DIRECTORY)
     app.chat_input[0].set_value("只保留 Bishan。").run()
     app.run()
     assert not app.exception
-    cleaned_key = app.selectbox[0].value
-    assert cleaned_key != original_key
+    assert set(store.list()) == {original_key}
+    assert app.selectbox[0].value == original_key
     assert app.dataframe[0].value["town"].tolist() == ["BISHAN", "BISHAN"]
-    assert any(item.label == "清洗逻辑与代码" for item in app.expander)
-    assert any("filter_frame" in item.value for item in app.code)
+    assert any("临时分析范围" in item.value for item in app.caption)
     app.chat_input[0].set_value("我可以看一下这份数据吗？").run()
     app.run()
     assert not app.exception
     assert app.dataframe[1].value["town"].tolist() == ["BISHAN", "BISHAN"]
-    assert app.session_state.turns[1].trace["working_data"]["before"][0]["tool"] == "filter_rows"
+    trace = app.session_state.turns[1].trace
+    assert trace["working_data"]["before"][0]["tool"] == "filter_rows"
+    assert trace["working_data"]["rows_after"] == trace["input_table"]["rows"] == 2
+    assert trace["working_data"]["temporary"]
+
+    fresh = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    assert len(fresh.dataframe[0].value) == 6
+    if save_in_chat:
+        app.chat_input[0].set_value("把筛选结果保存为新表。").run()
+    else:
+        next(button for button in app.button if button.label == "保存当前范围为数据版本").click().run()
+    app.run()
+    assert not app.exception
+    filtered_key = app.selectbox[0].value
+    catalog = store.list()
+    assert set(catalog) == {original_key, filtered_key} and filtered_key != original_key
+    saved = catalog[filtered_key]
+    assert saved.filter_only and "筛选版" in saved.label
+    assert any(item.label == "筛选逻辑与代码" for item in app.expander)
+    assert any("filter_frame" in item.value and saved.export_name in item.value for item in app.code)
     restore = next(button for button in app.button if button.label == "恢复原始数据")
     restore.click().run()
     assert not app.exception
     assert app.selectbox[0].value == original_key
     assert len(app.dataframe[0].value) == 6
 
-    fresh = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
-    fresh.selectbox[0].set_value(cleaned_key).run()
+    fresh.run()
+    fresh.selectbox[0].set_value(filtered_key).run()
     assert not fresh.exception
     assert len(fresh.dataframe[0].value) == 2
+
+
+def test_browser_can_save_a_filter_in_the_same_request(monkeypatch):
+    model = ScriptedModel([])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    store = table_store.TableStore(table_store.DATASET_DIRECTORY)
+    original_key = app.selectbox[0].value
+    app.chat_input[0].set_value("只看 town = BISHAN，计算 resale_price 的平均值，并保存当前数据表。").run()
+    app.run()
+    assert not app.exception
+    turn, = app.session_state.turns
+    assert "820,000" in turn.messages[-1].text and "已保存" in turn.messages[-1].text
+    assert app.selectbox[0].value != original_key and len(store.list()) == 2
+    assert turn.trace["working_data"]["saved_version"] == store.list()[app.selectbox[0].value].label
+    assert not turn.trace["working_data"]["temporary"]

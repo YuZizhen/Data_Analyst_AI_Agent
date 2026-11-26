@@ -30,10 +30,20 @@ class SavedTable:
     steps: tuple[dict, ...] = ()
 
     @property
+    def filter_only(self) -> bool:
+        return bool(self.steps) and all(step["tool"] == "filter_rows" for step in self.steps)
+
+    @property
+    def export_name(self) -> str:
+        prefix = "filtered" if self.filter_only else "cleaned"
+        return f"{prefix}-{self.key[:10]}.csv"
+
+    @property
     def label(self) -> str:
         name = "HDB 转售示例" if self.is_demo else self.name
         if self.steps:
-            return f"{name} · 清洗版 · {self.rows:,} 行 · {self.key[:6]}"
+            kind = "筛选版" if self.filter_only else "清洗版"
+            return f"{name} · {kind} · {self.rows:,} 行 · {self.key[:6]}"
         return f"{name} · 原表 · {self.rows:,} 行"
 
 
@@ -123,7 +133,7 @@ class TableStore:
         for function, step in zip(actions, entry.steps):
             lines.append(f"frame = {function.__name__}(frame, **{step['parameters']!r})")
         lines.extend([
-            "", f'frame.to_csv("cleaned-{entry.key[:10]}.csv", index=False, encoding="utf-8-sig", mode="x")', "",
+            "", f'frame.to_csv({entry.export_name!r}, index=False, encoding="utf-8-sig", mode="x")', "",
         ])
         code = "\n\n".join(getsource(function) for function in functions)
         return "\n".join(lines), code
