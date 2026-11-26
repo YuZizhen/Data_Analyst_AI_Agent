@@ -13,7 +13,7 @@ from langchain_core.tools import ToolException
 
 from src.tools.dataset import finite_numbers
 from src.tools.formulas import formula_values
-from src.tools.preprocessing import PREPARATION_FUNCTIONS, filter_frame
+from src.tools.preprocessing import PREPARATION_FUNCTIONS, drop_missing_frame, filter_frame
 
 NUMERIC_TOOLS = {
     "average_by_group", "group_report", "trend_report", "distribution_report",
@@ -89,6 +89,14 @@ def verify_requested_scope(source, frame, steps, inherited, request, tool, suppl
             expected = replay_scope(expected, {"steps": conversions})
             for item in conditions:
                 expected = filter_frame(expected, item["column_name"], item["operator"], item["value"])
+            if columns := request.get("missing_columns"):
+                expected = drop_missing_frame(expected, columns)
+                cleanups = [step["parameters"] for step in current if step["tool"] == "drop_missing"]
+                performed = cleanups == [{"columns": columns}]
+                checks.append(check("请求的缺失值处理", "passed" if performed else "failed",
+                                    f"要求删除这些字段缺失的行 · {'、'.join(columns)}。"
+                                    + ("" if performed else "未找到使用这些字段的清洗步骤。"), tool=tool))
+                current = [step for step in current if step["tool"] != "drop_missing"]
             expected = replay_scope(expected, {"steps": [step for step in current if step["tool"] != "convert_column"]})
             missing = len(expected.index.difference(frame.index))
             extra = len(frame.index.difference(expected.index))

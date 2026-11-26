@@ -238,9 +238,10 @@ def analyze(
                     reports.append(Report(artifact["title"], path.name, path.read_bytes(), artifact.get("feature_importance")))
         steps = tool_trace(messages, rejected)
         prepared_after = result.get("prepared")
-        input_frame = prepared_before.frame if prepared_before is not None else dataset.source_frame
+        input_table = result.get("input_working_table")
+        input_frame = input_table.frame if input_table is not None else dataset.source_frame
         input_label = dataset.selected.label
-        if "working_table" in st.session_state:
+        if input_table is not None and input_table.steps != dataset.selected.steps:
             input_label += " · 临时分析范围"
         output_frame = prepared_after.frame if prepared_after is not None else dataset.source_frame
         before_steps = list(prepared_before.steps) if prepared_before is not None else []
@@ -445,7 +446,8 @@ def show_execution_record(turn: Turn, trace: dict):
                     st.markdown(f"**{number}. {step['action']}**")
                     round_label = f"第 {step['round']} 轮 · " if step["round"] is not None else ""
                     st.caption(f"{round_label}{step['status']}")
-                    if trace["steps"][number - 1].get("rejected_by_validation"):
+                    rejected = trace["steps"][number - 1].get("rejected_by_validation")
+                    if rejected:
                         st.caption("校验未通过，结果已排除。")
                     if step["purpose"]:
                         st.text(f"用途 · {step['purpose']}")
@@ -453,9 +455,10 @@ def show_execution_record(turn: Turn, trace: dict):
                         st.text(f"做法 · {detail}")
                     for note in step["outcome"]:
                         st.text(note)
-                    for table in step["tables"]:
-                        st.caption(table["title"])
-                        st.dataframe(table["rows"], hide_index=True, width="stretch")
+                    if not rejected:
+                        for table in step["tables"]:
+                            st.caption(table["title"])
+                            st.dataframe(table["rows"], hide_index=True, width="stretch")
         if reviews:
             with tabs["候选字段审查"]:
                 for review, rejected in reviews:
@@ -508,9 +511,12 @@ def show_turn(turn: Turn):
             return
         trace = getattr(turn, "trace", None)
         if trace:
-            if expanded := trace.get("request_scope", {}).get("expanded_for_comparison"):
+            request_scope = trace.get("request_scope", {})
+            if expanded := request_scope.get("expanded_for_comparison"):
                 st.caption(f"本题要比较「{expanded['column']}」。已放宽上轮临时筛选，可比较的分组从 "
                            f"{expanded['kept_groups']:,} 个增至 {expanded['wide_groups']:,} 个。")
+            elif request_scope.get("expired_filters"):
+                st.caption("本轮已结束上轮的临时筛选。")
             for scope in trace.get("analysis_ranges", []):
                 st.caption(f"本轮数据 · {scope['table']} · 使用范围 {scope['rows']:,} 行")
                 if filters := scope_filter_text(scope["filters"]):
@@ -530,9 +536,13 @@ def show_turn(turn: Turn):
             elif last == "limited" and any(check.get("scope_comparison", {}).get("status") == "limited"
                                           for check in validation[-1]["checks"]):
                 st.caption("筛选范围只核对了一部分。打开「校验结果」查看哪些条件尚待确认。")
+        shown_previews = set()
         for artifact in tool_artifacts(turn.messages, (trace or {}).get("rejected_tool_calls", [])):
             if "table" in artifact:
-                show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])
+                preview = json.dumps([artifact["total_rows"], artifact["table"]], ensure_ascii=False)
+                if preview not in shown_previews:
+                    shown_previews.add(preview)
+                    show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])
             if groups := artifact.get("group_summary"):
                 st.dataframe(pd.DataFrame(groups["groups"]).rename(columns={
                     "group": "分组", "value": "统计值", "valid_rows": "参与统计的有效行数",
@@ -599,11 +609,13 @@ def main():
         prepared = working_table(dataset)
         frame = prepared.frame if prepared is not None else dataset.source_frame
         if "working_table" in st.session_state:
-            st.caption(f"当前对话使用临时分析范围 · {len(frame):,} 行")
+            st.caption(f"上轮临时分析范围 · {len(frame):,} 行")
             if prepared is not None:
-                active_filters = [step["parameters"] for step in prepared.steps if step["tool"] == "filter_rows"]
+                active_filters = [step["parameters"] for step in prepared.steps[len(dataset.selected.steps):]
+                                  if step["tool"] == "filter_rows"]
                 if filters := scope_filter_text(active_filters):
                     st.caption(filters)
+                    st.caption("新问题默认不沿用这些筛选。")
             if prepared is not None and st.button("保存当前范围为数据版本", width="stretch"):
                 try:
                     save_working_table(store, dataset, prepared, provider)
@@ -624,7 +636,7 @@ def main():
     st.markdown("用自然语言分析 CSV，生成可下载的图表。")
     with st.expander("预览数据"):
         if "working_table" in st.session_state:
-            st.caption("预览当前对话的临时分析范围。")
+            st.caption("预览上轮的临时分析范围。")
         show_preview(frame.head(DEFAULT_PREVIEW_ROWS), len(frame))
     if dataset.selected.steps:
         show_preparation(dataset, store)

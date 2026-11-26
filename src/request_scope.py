@@ -23,7 +23,7 @@ TEXT_ONLY = re.compile(
 )
 COUNT_QUESTION = re.compile(r"(?:一共|总共|总计|共有)(?:有)?(?:几个|几条|几行|多少(?:条|行|个|笔))", re.I)
 EXPLICIT_ROW_COUNT = re.compile(
-    r"(?:how many (?:rows|records)|(?:row|record) count|count (?:all |the )?(?:rows|records)|"
+    r"(?:how many (?:(?:of )?(?:these|those) )?(?:rows|records)|(?:row|record) count|count (?:all |the )?(?:rows|records)|"
     r"(?:总行数|记录总数|统计行数|统计记录数))", re.I,
 )
 REFERENCE_COUNT = re.compile(r"(?:这些|当前(?:的)?)(?:数据|记录|行)(?:一共|总共)?有?(?:几条|几行|多少(?:条|行))\s*[。！？?!.]*")
@@ -56,7 +56,7 @@ MULTI_RESULT = re.compile(
 )
 SIMPLE_MEASURE_WORDS = re.compile(
     r"\bwhat['’]s\b|\b(?:what|is|the|of|for|across|over|all|overall|current|active|records?|rows?|table|data|dataset|"
-    r"calculate|compute|find|give|me|please|show|how|much|many|in|are|was|were)\b"
+    r"calculate|compute|find|give|me|please|show|how|much|many|in|are|was|were|remain|remaining|left)\b"
     r"|请|帮我|计算|统计|全部|所有|当前|合计|是|多少|求|的|全表|记录", re.I,
 )
 DELIMITER = re.compile(r"""("[^"\n]*"|(?<!\w)'[^'\n]*'|「[^」\n]*」|`[^`\n]*`)|([、，,；;\n。！？?!]|\.(?=\s|$))""")
@@ -84,6 +84,62 @@ FORMULA_GROUPS = (
     re.compile(r"^\s*(?:(?:show|calculate|give me)\s+)?(?:the\s+)?(?:total|sum of)\s+(?P<measure>.+?)\s+by\s+(?P<group>.+?)\s*[?？.]*\s*$", re.I),
     re.compile(r"^\s*按\s*(?P<group>\w+)\s*(?:分组)?(?:计算|比较|汇总)\s*(?P<measure>\w+)\s*(?:的)?(?:总和|总量|合计)\s*[?？。]*\s*$", re.I),
 )
+DROP_MISSING_CLAUSES = (
+    re.compile(r"^(?:please\s+)?(?:remove|drop|delete) (?:the )?(?:rows|records) (?:where|with)\s+(.+?)\s+(?:(?:is|are)\s+)?(?:missing|null|blank|empty)$", re.I),
+    re.compile(r"^(?:please\s+)?(?:remove|drop|delete) (?:the )?(?:rows|records) with (?:missing|null|blank|empty)(?: values?)? in\s+(.+)$", re.I),
+    re.compile(r"^(?:请)?(?:删除|去掉|移除)\s*(.+?)\s*(?:为|是)?(?:缺失|空值|为空|空白)(?:的)?(?:行|记录)$"),
+)
+NUMERIC_SCOPE = re.compile(
+    r"\b(?:for|among|in|where)\s+(?P<column>[\w \x60-]+?)\s+(?P<value>[+-]?\d+(?:\.\d+)?)"
+    r"(?:\s+(?P<entity>[a-z]+))?\s*[?!.]*$", re.I,
+)
+RECORD_NOUNS = {"row", "record", "observation", "entry", "item", "sample"}
+
+
+def field_words(name):
+    return re.sub(r"[_\s-]+", " ", name.strip(" \x60\"'「」")).casefold()
+
+
+def resolve_field(name, columns, *, allow_prefix=False):
+    normalized = field_words(name)
+    matches = [column for column in columns if field_words(column) == normalized]
+    if not matches and allow_prefix:
+        matches = [column for column in columns if field_words(column).startswith(normalized + " ")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def extract_missing_cleanup(question, columns):
+    remaining, fields, unresolved = [], [], []
+    for fragment in clauses(question):
+        text = fragment.strip()
+        match = next((match for pattern in DROP_MISSING_CLAUSES if (match := pattern.fullmatch(text))), None)
+        if match is None:
+            remaining.append(fragment)
+            continue
+        field = resolve_field(match[1], columns)
+        if field is None:
+            unresolved.append(text)
+        elif field not in fields:
+            fields.append(field)
+    return "。".join(remaining) if fields or unresolved else question, fields, unresolved
+
+
+def numeric_measure_scope(question, frame):
+    """Read a single equality qualifier on an otherwise plain numeric measure."""
+    if not (match := NUMERIC_SCOPE.search(question)):
+        return question, []
+    column = resolve_field(match["column"], frame.columns, allow_prefix=True)
+    if column is None or not is_numeric_dtype(frame[column]) or is_bool_dtype(frame[column]):
+        return question, []
+    if entity := match["entity"]:
+        nouns = RECORD_NOUNS | {field_words(name).split(" ")[0] for name in frame.columns}
+        if entity.casefold().removesuffix("s") not in {noun.removesuffix("s") for noun in nouns}:
+            return question, []
+    measure = question[:match.start()].rstrip()
+    if not literal_measure(measure, frame)[1]:
+        return question, []
+    return measure, [{"column_name": column, "operator": "equals", "value": match["value"],
+                      "phrase": match[0].rstrip(" ?!."), "source": "explicit"}]
 
 
 class ResolvedClause(BaseModel):
@@ -296,12 +352,15 @@ def parse_request_scope(question: str, frame, *, labels_frame=None) -> dict:
     text_only = bool(TEXT_ONLY.search(question))
     show_filtered_rows = bool(FILTER_WRAPPER.search(question))
     question = TEXT_ONLY.sub("", question)
+    question, missing_columns, cleanup_unresolved = extract_missing_cleanup(question, frame.columns)
     formula = FORMULA_DEFINITION.search(question)
     if formula and re.search(r"[*/×÷+−-]", formula[2]):
         question = question[:formula.start()].strip()
     else:
         formula = None
-    conditions, unresolved = [], []
+    conditions, unresolved = [], list(cleanup_unresolved)
+    if not (formula or RESET.search(question)):
+        question, conditions = numeric_measure_scope(question, frame)
     in_scope = False
     alternatives = False
     for fragment in clauses(question):
@@ -357,7 +416,7 @@ def parse_request_scope(question: str, frame, *, labels_frame=None) -> dict:
     count_text = INCLUDE_MISSING.sub("", EXPLICIT_ROW_COUNT.sub("", question))
     direct_count = bool(REFERENCE_COUNT.fullmatch(question.strip())) or (
         bool(EXPLICIT_ROW_COUNT.search(question)) and not re.search(r"\w", SIMPLE_MEASURE_WORDS.sub("", count_text))
-    )
+    ) or (bool(missing_columns or cleanup_unresolved) and not question.strip(" .。?？"))
     if not GROUP_QUESTION.search(question):
         if COUNT_QUESTION.search(question) or direct_count:
             action = "count_rows"
@@ -394,6 +453,7 @@ def parse_request_scope(question: str, frame, *, labels_frame=None) -> dict:
             simple = True
     return {"conditions": conditions, "unresolved": list(dict.fromkeys(unresolved)),
             "reset": bool(RESET.search(question)), "has_alternatives": alternatives, "text_only": text_only,
+            "missing_columns": missing_columns,
             "row_task": task, "row_action": action, "direct_measure": simple and not unresolved and not alternatives,
             "only_output_fields": bool(ONLY_OUTPUT_FIELDS.search(question)),
             "show_filtered_rows": show_filtered_rows and bool(conditions)}
@@ -491,7 +551,12 @@ def resolve_observed_labels(question, scope, frame, invoke):
             still_unresolved.append(phrase)
     still_unresolved.extend(phrase for phrase in response.unresolved
                             if phrase and any(phrase in span for span in filter_spans) and phrase not in resolved_fragments)
-    task = scope["row_task"] or (response.row_task.model_dump() if response.row_task else None)
+    task = scope["row_task"]
+    if task is None and (suggested := response.row_task):
+        numeric_field = {"rank_rows": suggested.sort_column, "aggregate_column": suggested.value_column}.get(suggested.action)
+        if suggested.action == "count_rows" or (numeric_field in frame and is_numeric_dtype(frame[numeric_field])
+                                                and set(suggested.columns) <= set(frame.columns)):
+            task = suggested.model_dump()
     return {**scope, "conditions": conditions, "unresolved": list(dict.fromkeys(still_unresolved)), "row_task": task}
 
 

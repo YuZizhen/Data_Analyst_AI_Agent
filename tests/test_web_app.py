@@ -128,21 +128,89 @@ def test_preview_shows_the_uploaded_rows_even_if_model_invents_a_table(monkeypat
     csv = b"date,product,units_sold\n2025-01-05,A101,45\n2025-01-06,B202,12\n"
     entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("sales.csv", csv)
     invented = "Here is the preview:\n\n| date | product | units_sold |\n| --- | --- | --- |\n| 2024-01-01 | Laptop | 5 |"
-    model = ScriptedModel([call_tool("dataset_preview", "preview"), AIMessage(content=invented)])
+    model = ScriptedModel([
+        call_tool("dataset_preview", "preview", limit=20),
+        call_tool("dataset_preview", "repeat_with_default"),
+        AIMessage(content=invented),
+    ])
     monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
     app.selectbox[0].set_value(entry.key).run()
     app.chat_input[0].set_value("Let me take a look at the sales records.").run()
     app.run()
     assert not app.exception
+    assert len(app.dataframe) == 2
     assert app.dataframe[0].value.equals(app.dataframe[1].value)
     assert app.dataframe[1].value["product"].tolist() == ["A101", "B202"]
     assert all("Laptop" not in item.value for item in app.markdown)
 
-    app.chat_input[0].set_value("preview").run()
+    app.chat_input[0].set_value("can you show me the table now").run()
     app.run()
-    assert not app.exception and len(model.prompts) == 2
+    assert not app.exception and len(model.prompts) == 3
     assert app.dataframe[0].value.equals(app.dataframe[2].value)
+    assert len(app.session_state.turns[-1].trace["steps"]) == 1
+
+
+def test_browser_cleans_missing_scores_previews_and_averages_one_grade(monkeypatch):
+    csv = b"student_id,grade_level,test_score,notes\n101,9,88,\n103,10,75,absent often\n104,10,,\n106,11,95,\n109,10,86.5,\n110,10,78,\n111,10,95,\n"
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("test2.csv", csv)
+    model = ScriptedModel([])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+
+    for question in ("Remove rows where test_score is missing. How many rows remain?",
+                     "can you show me the table now", "What is the average test score for grade 10 students?"):
+        app.chat_input[0].set_value(question).run()
+        app.run()
+        assert not app.exception
+
+    cleanup, preview, average = app.session_state.turns
+    assert [step["tool"] for step in cleanup.trace["steps"]] == ["drop_missing", "count_rows"]
+    assert "**6 rows**" in cleanup.messages[-1].text
+    assert cleanup.trace["validation"][-1]["status"] == "passed"
+    step, = preview.trace["steps"]
+    assert step["tool"] == "dataset_preview" and step["evidence"]["preview"]["rows"] == 6
+    assert len(app.dataframe) == 2
+    assert [step["tool"] for step in average.trace["steps"]] == ["filter_rows", "aggregate_column"]
+    assert "**83.625**" in average.messages[-1].text
+    assert average.trace["validation"][-1]["status"] == "passed"
+    assert not model.prompts
+
+
+def test_independent_correlation_expires_previous_filters_but_keeps_cleaning(monkeypatch):
+    csv = b"student_id,grade_level,test_score,attendance\n101,9,95,60\n102,10,60,60\n103,10,80,80\n104,10,,90\n105,11,45,100\n"
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("observations.csv", csv)
+    model = ScriptedModel([
+        call_tool("filter_rows", "old", column_name="grade_level", operator="equals", value=10),
+        call_tool("relationship_report", "correlation", x_column="attendance", y_column="test_score"),
+        AIMessage(content="Here is the relationship between the two fields."),
+    ])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    for question in (
+        "Remove rows where test_score is missing. How many rows remain?",
+        "What is the average test score for grade 10 students?",
+        "How many of these rows remain?",
+        "Is there a relationship between attendance and test_score?",
+    ):
+        app.chat_input[0].set_value(question).run()
+        app.run()
+        assert not app.exception
+
+    cleanup, average, followup, correlation = app.session_state.turns
+    assert average.trace["analysis_ranges"][0]["rows"] == 2
+    assert followup.trace["analysis_ranges"] == average.trace["analysis_ranges"]
+    stale_attempt, scatter = correlation.trace["steps"]
+    assert stale_attempt["tool"] == "filter_rows" and stale_attempt["status"] == "error"
+    assert scatter["evidence"]["pairwise_correlation"]["paired_rows"] == 4
+    assert scatter["evidence"]["pairwise_correlation"]["r"] < 0
+    assert correlation.trace["input_table"]["rows"] == 4
+    assert correlation.trace["analysis_ranges"][0]["filters"] == []
+    assert [step["tool"] for step in correlation.trace["working_data"]["after"]] == ["drop_missing"]
+    assert correlation.trace["validation"][-1]["status"] == "passed"
+    assert any("本轮已结束上轮的临时筛选" in item.value for item in app.caption)
 
 
 def test_combined_preview_keeps_analysis_without_duplicate_markdown_table(tmp_path):
@@ -301,7 +369,7 @@ def test_browser_keeps_temporary_scope_and_saves_only_on_request(monkeypatch, sa
     assert app.selectbox[0].value == original_key
     assert app.dataframe[0].value["town"].tolist() == ["BISHAN", "BISHAN"]
     assert any("临时分析范围" in item.value for item in app.caption)
-    app.chat_input[0].set_value("我可以看一下这份数据吗？").run()
+    app.chat_input[0].set_value("Show me the current table.").run()
     app.run()
     assert not app.exception
     assert app.dataframe[1].value["town"].tolist() == ["BISHAN", "BISHAN"]

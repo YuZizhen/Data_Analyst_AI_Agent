@@ -66,6 +66,27 @@ def test_overall_statistics_execute_on_the_requested_scope(tmp_path, question, o
     assert not model.prompts
 
 
+def test_missing_cleanup_and_numeric_scope_follow_the_table_schema(tmp_path):
+    csv = tmp_path / "inventory.csv"
+    csv.write_text("item_id,batch_number,net-weight,comment\n1,2,15,\n2,2,,\n3,2,21,\n4,1,90,ok\n", encoding="utf-8")
+    model = ScriptedModel([])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = graph.invoke({"messages": [HumanMessage(content="Drop records with blank values in net weight. How many records are left?")]})
+    clean, count = tool_trace(result["messages"])
+    assert clean["tool"] == "drop_missing" and clean["parameters"]["columns"] == ["net-weight"]
+    assert count["evidence"]["row_count"]["rows"] == 3
+    assert result["validation"][-1]["status"] == "passed"
+    assert any(item["label"] == "请求的缺失值处理" for item in result["validation"][-1]["checks"])
+
+    result = graph.invoke({"messages": [HumanMessage(content="Find the mean net weight among batch 2 items.")],
+                           "prepared": result["prepared"]})
+    filtered, statistic = tool_trace(result["messages"])
+    assert filtered["parameters"] == {"column_name": "batch_number", "operator": "equals", "value": "2"}
+    assert statistic["evidence"]["column_statistic"]["value"] == 18
+    assert result["validation"][-1]["status"] == "passed"
+    assert not model.prompts
+
+
 def test_switching_an_analysis_category_keeps_the_selected_version_bounds(tmp_path):
     csv = tmp_path / "sales.csv"
     csv.write_text(
@@ -83,6 +104,12 @@ def test_switching_an_analysis_category_keeps_the_selected_version_bounds(tmp_pa
     assert followup["prepared"].frame["unit_price"].tolist() == [50]
     assert "**50**" in followup["messages"][-1].text
     assert followup["validation"][-1]["status"] == "passed"
+
+    overall = graph.invoke({"messages": [*followup["messages"], HumanMessage(content="How many rows?")],
+                            "selected_version": saved, "prepared": followup["prepared"]})
+    assert overall["prepared"].steps == saved.steps
+    assert "**2 records**" in overall["messages"][-1].text
+    assert overall["validation"][-1]["status"] == "passed"
 
 
 @pytest.mark.parametrize(("question", "answer", "expected"), [
