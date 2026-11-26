@@ -56,6 +56,8 @@ The sidebar's **当前使用的数据表** selector lists uploaded originals and
 
 For a saved version, open **筛选逻辑与代码** or **清洗逻辑与代码** to see the operations, parameters, row counts, replay script, Python implementations, and CSV download. Run the replay script from the project environment. It writes a separate output file.
 
+Select a table and click **×** beside the selector to remove the app's saved copy after confirmation. Deleting a saved version removes that version. Deleting an uploaded original also removes its saved versions. The built-in demo stays available.
+
 ### Try it with the demo CSV
 
 Use the original demo table for each example. Clear the temporary scope after the filtering example to return to all rows.

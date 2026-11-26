@@ -79,7 +79,8 @@ class Turn:
 
 
 def select_dataset(store: TableStore) -> Dataset:
-    upload = st.file_uploader("上传 CSV", type="csv")
+    upload_version = st.session_state.get("upload_widget_version", 0)
+    upload = st.file_uploader("上传 CSV", type="csv", key=f"csv_upload_{upload_version}")
     demo = store.save_original(f"{DATA_PATH.name} (synthetic demo)", DATA_PATH.read_bytes(), is_demo=True)
     pending = st.session_state.pop("select_table_next", None)
     fingerprint = (upload.name, sha256(upload.getbuffer()).hexdigest()) if upload is not None else None
@@ -100,17 +101,59 @@ def select_dataset(store: TableStore) -> Dataset:
         st.session_state.selected_table = pending
     if st.session_state.get("selected_table") not in entries:
         st.session_state.selected_table = demo.key
-    key = st.selectbox("当前使用的数据表", keys, format_func=lambda key: entries[key].label, key="selected_table")
+    selector, actions = st.columns([5, 1], vertical_alignment="bottom")
+    key = selector.selectbox("当前使用的数据表", keys, format_func=lambda key: entries[key].label, key="selected_table")
+    selected = entries[key]
+    if actions.button("×", help="删除当前选择的数据表", key="delete_selected_table",
+                      disabled=key == demo.key, width="stretch"):
+        st.session_state.delete_table = (key, store.deletion_versions(selected, entries))
+    if confirmation := st.session_state.get("delete_table"):
+        if confirmation[0] == key and key != demo.key:
+            confirm_table_deletion(store, selected, confirmation[1], demo.key)
+        else:
+            st.session_state.pop("delete_table")
+    if st.session_state.pop("table_deleted", False):
+        st.success("已删除数据表。")
+
     cached = st.session_state.get("loaded_table")
     if cached is not None and cached[0] == key:
         return cached[1]
-    selected = entries[key]
     original = entries[selected.source_key]
     source_frame = store.read(original)
     frame = source_frame if selected.key == original.key else store.read(selected)
     dataset = Dataset(selected, original, frame, source_frame)
     st.session_state.loaded_table = (key, dataset)
     return dataset
+
+
+def confirm_table_deletion(store: TableStore, selected: SavedTable, versions: tuple[str, ...], demo_key: str) -> None:
+    with st.container(border=True):
+        st.warning("永久删除工作台中保存的这张数据表？")
+        st.text(selected.label)
+        if versions:
+            st.caption(f"同时删除基于此表保存的 {len(versions):,} 个筛选版或清洗版。")
+        cancel, confirm = st.columns(2)
+        if cancel.button("取消", key="cancel_table_deletion", width="stretch"):
+            st.session_state.pop("delete_table")
+            st.rerun()
+        if confirm.button("确认删除", key="confirm_table_deletion", type="primary", width="stretch"):
+            st.session_state.pop("delete_table")
+            try:
+                store.delete(selected.key, versions=versions)
+            except ValueError:
+                st.error("数据表或其保存的版本已有变化，请重新选择后确认。")
+            except OSError:
+                st.error("无法完成删除。请检查本地数据文件是否被占用。")
+            else:
+                if selected.key == selected.source_key:
+                    if st.session_state.get("upload_fingerprint") == (selected.name, selected.checksum):
+                        st.session_state.upload_widget_version = st.session_state.get("upload_widget_version", 0) + 1
+                    st.session_state.select_table_next = demo_key
+                else:
+                    st.session_state.select_table_next = selected.source_key
+                st.session_state.pop("loaded_table", None)
+                st.session_state.table_deleted = True
+                st.rerun()
 
 
 def working_table(dataset: Dataset) -> PreparedDataset | None:

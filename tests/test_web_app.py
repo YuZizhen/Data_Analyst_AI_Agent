@@ -353,6 +353,49 @@ def test_browser_can_save_a_filter_in_the_same_request(monkeypatch):
     assert not turn.trace["working_data"]["temporary"]
 
 
+@pytest.mark.parametrize("delete_original", [False, True])
+def test_browser_can_delete_an_upload_or_a_saved_version(monkeypatch, delete_original):
+    store = table_store.TableStore(table_store.DATASET_DIRECTORY)
+    upload = ("sales.csv", b"region,price\nNorth,50\nSouth,100\n", "text/csv")
+    unrelated = store.save_original(upload[0], b"region,price\nEast,60\n")
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: ScriptedModel([]))
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    demo_key = app.selectbox[0].value
+    assert app.button(key="delete_selected_table").proto.disabled
+
+    app.file_uploader[0].set_value(upload).run()
+    original = app.selectbox[0].value
+    assert original not in {demo_key, unrelated.key}
+    app.chat_input[0].set_value("只看 region = North，计算 price 的平均值，并保存当前数据表。").run()
+    app.run()
+    version = app.selectbox[0].value
+    assert store.list()[version].source_key == original
+    if delete_original:
+        app.selectbox[0].set_value(original).run()
+
+    app.button(key="delete_selected_table").click().run()
+    assert any("同时删除" in item.value for item in app.caption) == delete_original
+    app.button(key="cancel_table_deletion").click().run()
+    assert set(store.list()) == {demo_key, unrelated.key, original, version}
+    assert not app.button(key="delete_selected_table").proto.disabled
+    app.button(key="delete_selected_table").click().run()
+    app.button(key="confirm_table_deletion").click().run()
+
+    assert not app.exception
+    assert any("已删除数据表" in item.value for item in app.success)
+    assert app.selectbox[0].value == (demo_key if delete_original else original)
+    assert not store.path(version).exists()
+    assert store.path(original).exists() != delete_original
+    assert store.path(unrelated.key).exists()
+    app.run()
+    assert not app.exception and not store.path(version).exists()
+    if delete_original:
+        assert not store.path(original).exists()
+        app.file_uploader[0].set_value(upload).run()
+        assert app.selectbox[0].value == original
+        assert store.path(original).exists() and not store.path(version).exists()
+
+
 @pytest.mark.parametrize("followup", ["那 Furniture 呢？", "那 Furniture 的均价呢？", "What is the average unit price for Furniture?"])
 def test_chat_clarifies_category_scope_and_shows_the_actual_scope(monkeypatch, followup):
     store = table_store.TableStore(table_store.DATASET_DIRECTORY)

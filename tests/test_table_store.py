@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from src.table_store import TableStore
 from src.tools import PreparedDataset
@@ -33,3 +34,29 @@ def test_saved_tables_and_replay(tmp_path, monkeypatch):
     exec(compile(script, "replay.py", "exec"), {})
     output = Path(f"cleaned-{saved.key[:10]}.csv")
     assert pd.read_csv(output)["region"].tolist() == [" East "]
+
+
+def test_delete_checks_the_confirmed_versions_and_rolls_back_a_failed_move(tmp_path, monkeypatch):
+    store = TableStore(tmp_path / "t")
+    original = store.save_original("data.csv", b"region\nEast\nWest\n")
+    params = {"column_name": "region", "operator": "equals", "value": "East"}
+    steps = ({"tool": "filter_rows", "parameters": params, "rows_before": 2, "rows_after": 1, "detail": "Filtered."},)
+    frame = filter_frame(store.read(original), **params)
+    version = store.save_prepared(original, PreparedDataset(frame, steps))
+
+    with pytest.raises(ValueError, match="versions changed"):
+        store.delete(original.key)
+    assert set(store.list()) == {original.key, version.key}
+
+    rename = Path.rename
+
+    def locked_version(path, target):
+        if path == store.path(version.key):
+            raise PermissionError("The version is in use.")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", locked_version)
+    with pytest.raises(PermissionError):
+        store.delete(original.key, versions=(version.key,))
+    assert set(store.list()) == {original.key, version.key}
+    assert not list(store.directory.glob("*.del"))

@@ -7,6 +7,8 @@ from inspect import getsource
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from threading import Lock
+from uuid import uuid4
 
 import pandas as pd
 import pyarrow as pa
@@ -17,6 +19,7 @@ from src.tools.preprocessing import PREPARATION_FUNCTIONS
 
 DATASET_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "private" / "datasets"
 METADATA_KEY = b"data_analyst_table"
+TABLE_WRITE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -76,26 +79,60 @@ class TableStore:
     def read(self, entry: SavedTable) -> pd.DataFrame:
         return pq.read_table(self.path(entry.key)).to_pandas()
 
-    def _save(self, entry: SavedTable, frame: pd.DataFrame) -> SavedTable:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.path(entry.key)
-        if path.exists():
-            return self._metadata(path)
-        table = pa.Table.from_pandas(frame)
-        metadata = dict(table.schema.metadata or {})
-        metadata[METADATA_KEY] = json.dumps(asdict(entry), ensure_ascii=False).encode("utf-8")
-        with NamedTemporaryFile(dir=self.directory, suffix=".tmp", delete=False) as handle:
-            temporary = Path(handle.name)
-        try:
-            pq.write_table(table.replace_schema_metadata(metadata), temporary)
+    @staticmethod
+    def deletion_versions(entry: SavedTable, entries: dict[str, SavedTable]) -> tuple[str, ...]:
+        if entry.key != entry.source_key:
+            return ()
+        return tuple(sorted(other.key for other in entries.values()
+                            if other.source_key == entry.key and other.key != entry.key))
+
+    def delete(self, key: str, *, versions: tuple[str, ...] = ()) -> None:
+        with TABLE_WRITE_LOCK:
+            entries = self.list()
+            entry = entries.get(key)
+            if entry is None or (entry.is_demo and entry.key == entry.source_key):
+                raise ValueError("The selected table cannot be deleted.")
+            if versions != self.deletion_versions(entry, entries):
+                raise ValueError("The table's versions changed before deletion.")
+
+            # Move the confirmed files out of the catalog before removing them.
+            moved = []
             try:
-                temporary.replace(path)
-            except PermissionError:
-                if not path.exists():
-                    raise
+                for table_key in (key, *versions):
+                    path = self.path(table_key)
+                    staged = path.with_name(f".{uuid4().hex[:20]}.del")
+                    path.rename(staged)
+                    moved.append((path, staged))
+            except OSError:
+                for path, staged in reversed(moved):
+                    staged.rename(path)
+                raise
+            for _, staged in moved:
+                staged.unlink()
+
+    def _save(self, entry: SavedTable, frame: pd.DataFrame) -> SavedTable:
+        with TABLE_WRITE_LOCK:
+            if entry.key != entry.source_key and not self.path(entry.source_key).is_file():
+                raise ValueError("The original table no longer exists.")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            path = self.path(entry.key)
+            if path.exists():
                 return self._metadata(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+            table = pa.Table.from_pandas(frame)
+            metadata = dict(table.schema.metadata or {})
+            metadata[METADATA_KEY] = json.dumps(asdict(entry), ensure_ascii=False).encode("utf-8")
+            with NamedTemporaryFile(dir=self.directory, suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+            try:
+                pq.write_table(table.replace_schema_metadata(metadata), temporary)
+                try:
+                    temporary.replace(path)
+                except PermissionError:
+                    if not path.exists():
+                        raise
+                    return self._metadata(path)
+            finally:
+                temporary.unlink(missing_ok=True)
         return entry
 
     def save_original(self, name: str, data: bytes, *, is_demo: bool = False) -> SavedTable:
