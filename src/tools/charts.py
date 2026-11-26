@@ -10,9 +10,13 @@ from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
 from src.reports import render_report
 
 from .dataset import AnalysisContext, CHART_COLOR, column, load_dataset, numeric_column, working_frame, working_source
+from .formulas import formula_values
 
 Aggregation = Literal["mean", "median", "sum", "count"]
 AGGREGATION_LABELS = {"mean": "Average", "median": "Median", "sum": "Total"}
+GROUP_STATISTICS = {
+    "mean": ("平均值", "mean"), "median": ("中位数", "median"), "sum": ("总和", "total"), "count": ("记录数", "row count"),
+}
 
 
 def summarize_groups(
@@ -22,6 +26,35 @@ def summarize_groups(
     if aggregation == "sum":
         return grouped.sum(min_count=1).dropna()
     return grouped.agg(aggregation).dropna()
+
+
+def group_results(table, groups, values):
+    counts = values.groupby(groups, dropna=False, observed=True).count().reindex(table.index)
+    displayed = pd.DataFrame({"statistic": table, "valid_rows": counts})
+    summary = [{"group": "(Missing)" if pd.isna(name) else str(name), "value": float(value), "valid_rows": int(count)}
+               for name, value, count in zip(table.index, table, counts)]
+    return displayed.to_string(), summary
+
+
+def grouped_answer(result: dict, *, chinese: bool) -> str:
+    group = result["group_column"]
+    field = result["value_column"]
+    zh, en = GROUP_STATISTICS[result["aggregation"]]
+    if not result["groups"]:
+        return "当前范围没有可显示的分组结果。" if chinese else "There are no group results for the current scope."
+    first = result["groups"][0]
+    leading = [row for row in result["groups"] if row["value"] == first["value"]]
+    value = f"{first['value']:,.12g}"
+    used, total = result["rows_used"], result["working_rows"]
+    shown, all_groups = len(result["groups"]), result["group_count"]
+    if chinese:
+        metric = f"「{field}」的{zh}" if field else zh
+        line = f"按「{group}」计算{metric}。最高值为 **{value}**（{'、'.join(row['group'] for row in leading)}）。"
+        return f"{line} 结果展示 {all_groups:,} 组中的 {shown:,} 组。本次分组统计使用了 {total:,} 条记录中的 **{used:,} 条**有效记录。"
+    labels = ", ".join(row["group"] for row in leading)
+    metric = f"{en} of {field}" if field else en
+    return (f"Grouped the {metric} by {group}. The highest value is **{value}** ({labels}). "
+            f"Showing {shown:,} of {all_groups:,} groups, using {used:,} of {total:,} rows.")
 
 
 def metric(
@@ -77,33 +110,58 @@ def group_distribution_report(
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
 def average_by_group(
-    group_column: str, value_column: str, top_n: int = 10,
-    runtime: ToolRuntime[AnalysisContext] = None,
+    group_column: str, value_column: str | None = None, top_n: int = 10,
+    runtime: ToolRuntime[AnalysisContext] = None, aggregation: Aggregation = "mean",
 ) -> tuple[str, dict]:
-    """Calculate text-only group averages. For a chart, use group_report instead.
+    """Calculate group statistics without a chart: mean, median, total, or row count.
 
     Args:
         group_column: Name of the categorical column (such as town).
-        value_column: Name of the numeric column (such as resale_price).
+        value_column: Name of the numeric column. Omit when counting all rows.
         top_n: Number of groups to return, between 1 and 25.
+        aggregation: Statistic per group. Pass sum for totals or count for row counts.
     """
     df = working_frame(runtime.context, runtime.state) if runtime else load_dataset()
     try:
         if not 1 <= top_n <= 25:
             raise ToolException("top_n must be between 1 and 25.")
         groups = column(df, group_column)
-        values = numeric_column(df, value_column)
+        values, label = metric(df, aggregation, value_column)
     except ToolException as error:
         if runtime is not None:
             raise
         return str(error), {}
 
-    ranked = summarize_groups(groups, values, "mean")
+    ranked = summarize_groups(groups, values, aggregation)
     table = ranked.nlargest(top_n)
-    return "Average by group (descending):\n" + table.to_string(), {"group_summary": {
+    displayed, summary = group_results(table, groups, values)
+    return f"{label} by {group_column} (descending):\n{displayed}", {"group_summary": {
+        "aggregation": aggregation, "group_column": group_column, "value_column": value_column,
         "rows_used": int(values.count()), "working_rows": len(df), "group_count": len(ranked),
-        "groups": [{"group": "(Missing)" if pd.isna(name) else str(name), "value": float(value)} for name, value in table.items()],
+        "groups": summary,
     }}
+
+
+@tool(response_format="content_and_artifact", parse_docstring=True)
+def formula_group_totals(
+    group_column: str, value_column: str, expression: str, runtime: ToolRuntime[AnalysisContext],
+) -> tuple[str, dict]:
+    """Evaluate an arithmetic formula on every row and sum its values by group.
+
+    Args:
+        group_column: Exact CSV column used for grouping.
+        value_column: Display name of the derived measure.
+        expression: User-provided formula using numeric columns and arithmetic.
+    """
+    frame = working_frame(runtime.context, runtime.state)
+    groups = column(frame, group_column)
+    values = formula_values(frame, expression)
+    ranked = summarize_groups(groups, values, "sum")
+    displayed, summary = group_results(ranked.nlargest(25), groups, values)
+    evidence = {"aggregation": "sum", "group_column": group_column, "value_column": value_column,
+                "expression": expression, "rows_used": int(values.count()), "working_rows": len(frame),
+                "group_count": len(ranked), "groups": summary}
+    return f"Calculated {value_column} = {expression} per row, then summed by {group_column}.\n{displayed}", {"group_summary": evidence}
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)
@@ -149,11 +207,13 @@ def group_report(
         context.output_dir, "group", title, subtitle, working_source(context, runtime.state), draw,
         height=max(5.2, 2.6 + len(table) * 0.29),
     )
+    displayed, summary = group_results(table, groups, values)
     artifact["group_summary"] = {
+        "aggregation": aggregation, "group_column": group_column, "value_column": value_column,
         "rows_used": int(values.count()), "working_rows": len(df), "group_count": len(ranked),
-        "groups": [{"group": name, "value": float(value)} for name, value in zip(display_labels, table)],
+        "groups": summary,
     }
-    return f"PNG report created. {title}\n{subtitle}\n{table.to_string()}", artifact
+    return f"PNG report created. {title}\n{subtitle}\n{displayed}", artifact
 
 
 @tool(response_format="content_and_artifact", parse_docstring=True)

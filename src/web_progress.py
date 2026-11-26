@@ -17,7 +17,7 @@ class Activity:
     tool_call_id: str = ""
 
 
-METRIC_LABELS = {"mean": "平均值", "median": "中位数", "sum": "总和"}
+METRIC_LABELS = {"mean": "平均值", "median": "中位数", "sum": "总和", "min": "最小值", "max": "最大值"}
 PERIOD_LABELS = {"day": "天", "week": "周", "month": "月", "quarter": "季度", "year": "年"}
 PREDICTION_MODELS = {"decision_tree": "单棵决策树", "linear_regression": "线性回归", "ridge": "岭回归", "random_forest": "随机森林"}
 FILTER_LABELS = {
@@ -47,6 +47,18 @@ def describe_call(name: str, args: dict) -> Activity | None:
             row_range = f"最多 {limit} 行" if isinstance(limit, int) and 1 <= limit <= 50 else "记录"
             detail = f"读取表格开头{row_range}，保留原始列。"
             return Activity("预览数据", details=(detail,))
+        case "count_rows":
+            return Activity("统计记录数", details=("统计当前工作表的所有行，包含其他字段有缺失值的记录。",))
+        case "aggregate_column":
+            metric = METRIC_LABELS.get(params.get("statistic"), "统计值")
+            return Activity("计算整列统计", details=(f"在当前数据范围计算{field_label(value)}的{metric}。",))
+        case "formula_group_totals":
+            return Activity("逐行计算公式并分组求和", details=(
+                f"按{field_label(params.get('group_column'))}汇总{field_label(value)}。公式为 {params.get('expression', '')}。",
+            ))
+        case "rank_rows":
+            field = field_label(params.get("sort_column"))
+            return Activity("排序并列出原始记录", details=(f"按{field}排序，保留指定的字段和记录条数。",))
         case "profile_dataset":
             return Activity("检查数据质量", details=("检查选定列的数据类型、空值和不同取值数。",))
         case "inspect_column_values":
@@ -118,7 +130,7 @@ def describe_call(name: str, args: dict) -> Activity | None:
 
 def activity_for_update(update):
     for node, state in update.items():
-        if node not in {"analyst", "request_preview", "chart_ranking"}:
+        if node not in {"analyst", "request_preview", "chart_ranking", "execute_row_step"}:
             continue
         for message in (state or {}).get("messages", []):
             if not isinstance(message, AIMessage):

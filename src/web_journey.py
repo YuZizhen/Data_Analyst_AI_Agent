@@ -1,11 +1,15 @@
 """Readable descriptions of recorded tool decisions and results."""
 
-from src.web_progress import PREDICTION_MODELS, describe_call
+from src.web_progress import METRIC_LABELS, PREDICTION_MODELS, describe_call
 from src.tools.candidates import review_counts
 
 PURPOSES = {
     "dataset_overview": "先确认列名和数据规模，再选择适合的计算方法。",
     "dataset_preview": "抽看数据行可以确认字段含义和实际录入格式。",
+    "count_rows": "数当前工作表中的每条记录，包括其他字段缺失的行。",
+    "aggregate_column": "用范围内该列的有效数值计算一个整体指标。",
+    "formula_group_totals": "先用每行的字段值计算公式，再比较各组的合计。",
+    "rank_rows": "按指定值排序，保留原始记录的对应字段。",
     "profile_dataset": "缺失值、字段类型和取值数量会影响后续能做哪些统计。",
     "inspect_column_values": "先确认表里真实使用的标签，筛选时才能匹配正确的记录。",
     "filter_rows": "先确定这次要分析的范围，后续统计才会用到符合条件的记录。",
@@ -71,8 +75,16 @@ def summarize_evidence(evidence: dict) -> tuple[list[str], list[dict]]:
     if groups := evidence.get("group_summary"):
         notes.append(f"使用 {groups['rows_used']:,} / {groups['working_rows']:,} 行，共得到 {groups['group_count']:,} 组。")
         tables.append({"title": "分组统计结果", "rows": [
-            {"分组": row["group"], "数值": row["value"]} for row in groups["groups"]
+            {"分组": row["group"], "数值": row["value"], "有效行数": row.get("valid_rows")} for row in groups["groups"]
         ]})
+    if count := evidence.get("row_count"):
+        notes.append(f"当前范围共有 {count['rows']:,} 条记录，包含字段缺失的记录。")
+    if stat := evidence.get("column_statistic"):
+        label = METRIC_LABELS[stat["statistic"]]
+        value = f"{stat['value']:,}" if stat["value"] is not None else "没有有效数值"
+        notes.append(f"「{stat['value_column']}」的{label}为 {value}。使用了 {stat['working_rows']:,} 行中的 {stat['valid_rows']:,} 个有效值。")
+    if ranked := evidence.get("ranked_rows"):
+        notes.append(f"从 {ranked['working_rows']:,} 行中找到 {ranked['rows_with_sort_value']:,} 条可排序记录，显示 {len(ranked['rows']):,} 条。")
     if trend := evidence.get("trend_summary"):
         notes.append(
             f"用 {trend['rows_used']:,} 行汇总了 {trend['periods']:,} 个时间段。"

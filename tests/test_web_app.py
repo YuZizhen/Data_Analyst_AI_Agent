@@ -124,6 +124,43 @@ def test_browser_previews_actual_rows_and_records_tool_response(monkeypatch):
     }]
 
 
+def test_preview_shows_the_uploaded_rows_even_if_model_invents_a_table(monkeypatch):
+    csv = b"date,product,units_sold\n2025-01-05,A101,45\n2025-01-06,B202,12\n"
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("sales.csv", csv)
+    invented = "Here is the preview:\n\n| date | product | units_sold |\n| --- | --- | --- |\n| 2024-01-01 | Laptop | 5 |"
+    model = ScriptedModel([call_tool("dataset_preview", "preview"), AIMessage(content=invented)])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    app.chat_input[0].set_value("Let me take a look at the sales records.").run()
+    app.run()
+    assert not app.exception
+    assert app.dataframe[0].value.equals(app.dataframe[1].value)
+    assert app.dataframe[1].value["product"].tolist() == ["A101", "B202"]
+    assert all("Laptop" not in item.value for item in app.markdown)
+
+    app.chat_input[0].set_value("preview").run()
+    app.run()
+    assert not app.exception and len(model.prompts) == 2
+    assert app.dataframe[0].value.equals(app.dataframe[2].value)
+
+
+def test_combined_preview_keeps_analysis_without_duplicate_markdown_table(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("product,units_sold\nA101,45\nB202,12\n", encoding="utf-8")
+    model = ScriptedModel([
+        call_tool("dataset_preview", "preview"), call_tool("count_rows", "count"),
+        AIMessage(content="| product | units_sold |\n| --- | --- |\n| Laptop | 5 |\n\nThere are 2 rows."),
+    ])
+    result = agent.build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({
+        "messages": [{"role": "user", "content": "Show me the sales records and count them."}],
+    })
+    assert result["messages"][-1].text == "There are 2 rows."
+    preview, count = agent.tool_artifacts(result["messages"])
+    assert preview["table"]["data"] == [["A101", 45], ["B202", 12]]
+    assert count["row_count"]["rows"] == 2
+
+
 def test_browser_reports_an_empty_reply_without_claiming_analysis_finished(monkeypatch):
     model = ScriptedModel([AIMessage(content=""), AIMessage(content="\n")])
     monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
@@ -134,6 +171,62 @@ def test_browser_reports_an_empty_reply_without_claiming_analysis_finished(monke
     assert any("本轮没有执行分析" in item.value for item in app.markdown)
     assert all("分析已完成" not in item.value for item in app.markdown)
     assert len(model.prompts) == 2 and app.session_state.turns[0].trace is None
+
+
+def test_sales_conversation_answers_the_total_and_handles_a_correction(monkeypatch):
+    csv = ("region,units_sold\nNorth,45\nSouth,12\nEast,30\nWest,88\nNorth,20\nSouth,15\n"
+           "East,50\nWest,8\nNorth,60\nSouth,40\n")
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("sales.csv", csv.encode())
+    model = ScriptedModel([
+        call_tool("dataset_overview", "schema"), AIMessage(content="10 rows and 2 columns."),
+    ])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    for question in ("Show me a preview of the data", "How many rows are there and what columns do we have?",
+                     "What is the total units sold across all records?", "it is not a summary"):
+        app.chat_input[0].set_value(question).run()
+        app.run()
+        assert not app.exception
+    turns = app.session_state.turns
+    assert [turn.trace["steps"][-1]["tool"] for turn in turns] == [
+        "dataset_preview", "dataset_overview", "aggregate_column", "aggregate_column",
+    ]
+    assert all("**368**" in turn.messages[-1].text and turn.trace["validation"][-1]["status"] == "passed"
+               for turn in turns[-2:])
+
+
+def test_browser_renders_the_filtered_rows_and_the_formula_totals(monkeypatch):
+    csv = (
+        "category,units_sold,unit_price,discount\nElectronics,45,120,.05\nFurniture,12,85,0\n"
+        "Electronics,30,120,.1\nClothing,88,45,.15\nFurniture,20,85,0\nElectronics,15,115,.05\n"
+        "Clothing,50,45,.2\nFurniture,8,90,0\nElectronics,60,110,.08\nClothing,40,42,.1\n"
+    )
+    entry = table_store.TableStore(table_store.DATASET_DIRECTORY).save_original("sales.csv", csv.encode())
+    model = ScriptedModel([])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    app.chat_input[0].set_value("Only show rows where category is Electronics. What's the average unit price?").run()
+    app.run()
+    assert not app.exception
+    turn, = app.session_state.turns
+    assert [step["tool"] for step in turn.trace["steps"]] == ["filter_rows", "dataset_preview", "aggregate_column"]
+    assert any(item.value["category"].tolist() == ["Electronics"] * 4 for item in app.dataframe if "category" in item.value)
+    assert "**116.25**" in turn.messages[-1].text
+    assert turn.trace["validation"][-1]["status"] == "passed"
+
+    app.selectbox[0].set_value(entry.key).run()
+    app.chat_input[0].set_value("Which category has the highest total revenue? (revenue = units_sold × unit_price × (1 − discount))").run()
+    app.run()
+    assert not app.exception
+    turn = app.session_state.turns[-1]
+    step, = turn.trace["steps"]
+    assert step["tool"] == "formula_group_totals"
+    assert "**16,080.75** (Electronics)" in turn.messages[-1].text
+    assert [round(row["value"], 2) for row in step["evidence"]["group_summary"]["groups"]] == [16080.75, 6678, 3440]
+    assert turn.trace["validation"][-1]["status"] == "passed"
+    assert not model.prompts
 
 
 def test_journey_explains_the_relationship_tool_with_its_actual_results(monkeypatch):

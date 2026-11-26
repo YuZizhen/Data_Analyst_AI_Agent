@@ -13,7 +13,7 @@ from langchain_openai import ChatOpenAI
 
 from src.agent import MAX_TOOL_TURNS, build_agent, build_model, print_answer, tool_artifacts, tool_trace
 from src.request_scope import ScopeLabels, parse_request_scope, resolve_observed_labels
-from src.tools import charts, predictions
+from src.tools import charts, predictions, rows
 
 
 class ScriptedModel:
@@ -34,6 +34,168 @@ class ScriptedModel:
 
 def call_tool(name, call_id, **args):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+@pytest.mark.parametrize(("question", "operation", "expected", "valid_rows"), [
+    ("What is the total units sold across all records?", "sum", 368, 10),
+    ("How many units were sold in total?", "sum", 368, 10),
+    ("计算 units_sold 的总和。", "sum", 368, 10),
+    ("What is the mean of units sold?", "mean", 36.8, 10),
+    ("What is the median of units sold?", "median", 35, 10),
+    ("What is the minimum of units sold?", "min", 8, 10),
+    ("What is the maximum units sold?", "max", 88, 10),
+    ("Only region = East, calculate the total units sold.", "sum", 80, 2),
+])
+def test_overall_statistics_execute_on_the_requested_scope(tmp_path, question, operation, expected, valid_rows):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("region,units_sold\nNorth,45\nSouth,12\nEast,30\nWest,88\nNorth,20\nSouth,15\n"
+                   "East,50\nWest,8\nNorth,60\nSouth,40\n", encoding="utf-8")
+    model = ScriptedModel([])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = graph.invoke({"messages": [HumanMessage(content=question)]})
+    steps = tool_trace(result["messages"])
+    step = steps[-1]
+    assert step["tool"] == "aggregate_column"
+    assert step["evidence"]["column_statistic"] == {
+        "value_column": "units_sold", "value": expected, "valid_rows": valid_rows,
+        "working_rows": valid_rows, "statistic": operation,
+    }
+    assert f"**{expected}**" in result["messages"][-1].text
+    attempt, = result["validation"]
+    assert attempt["status"] == "passed" and any(item["label"] == "请求的操作" for item in attempt["checks"])
+    assert not model.prompts
+
+
+@pytest.mark.parametrize(("question", "value", "rows_used"), [
+    ("Only show rows where category is Electronics. What's the average unit price?", 110, 2),
+    ("What’s the average unit price where category is Electronics?", 110, 2),
+    ("只看 category 为 Electronics。unit_price 的平均值是多少？", 110, 2),
+    ("Only show rows where unit_price >= 100.50. What's the average unit price?", 120, 1),
+    ("Only show rows where category is not Electronics. What's the average unit price?", 50, 1),
+    ("Only show rows where category is 'Co. A, B'. What's the average unit price?", 50, 1),
+])
+def test_filter_and_average_with_prose_equality_and_sentence_punctuation(tmp_path, question, value, rows_used):
+    csv = tmp_path / "sales.csv"
+    csv.write_text('category,unit_price\nElectronics,120\nElectronics,100\n"Co. A, B",50\n', encoding="utf-8")
+    graph = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path)
+    result = graph.invoke({"messages": [HumanMessage(content=question)]})
+    assert not result["request_scope"]["unresolved"]
+    steps = tool_trace(result["messages"])
+    assert steps[0]["tool"] == "filter_rows"
+    assert steps[-1]["evidence"]["column_statistic"]["value"] == value
+    assert steps[-1]["evidence"]["column_statistic"]["valid_rows"] == rows_used
+    assert result["validation"][-1]["status"] == "passed"
+
+
+@pytest.mark.parametrize(("question", "field"), [
+    ("Which category has the highest total revenue? (revenue = units_sold × unit_price × (1 − discount))", "revenue"),
+    ("Calculate total net by category (net = units_sold * unit_price * (1 - discount))", "net"),
+])
+def test_formula_is_evaluated_on_rows_before_grouping(tmp_path, question, field):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("category,units_sold,unit_price,discount\nA,10,5,0\nA,1,100,0.5\nB,1,110,0\n", encoding="utf-8")
+    result = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content=question),
+    ]})
+    step, = tool_trace(result["messages"])
+    assert step["tool"] == "formula_group_totals" and step["status"] == "success"
+    summary = step["evidence"]["group_summary"]
+    assert summary["value_column"] == field
+    assert summary["groups"] == [{"group": "B", "value": 110, "valid_rows": 1}, {"group": "A", "value": 100, "valid_rows": 2}]
+    assert result["validation"][-1]["status"] == "passed" and "**110** (B)" in result["messages"][-1].text
+
+
+def test_unsupported_formula_is_reported_without_calculating_a_different_metric(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("category,units_sold\nA,10\nB,1\n", encoding="utf-8")
+    result = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="Which category has the highest total revenue? (revenue = round(units_sold) * 2)"),
+    ]})
+    step, = tool_trace(result["messages"])
+    assert step["tool"] == "formula_group_totals" and step["status"] == "error"
+    assert not list(tool_artifacts(result["messages"]))
+
+
+def test_count_and_grouped_total_are_different_on_the_same_table(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("zone,units_sold\nNorth,10\nNorth,\nSouth,30\nSouth,35\n", encoding="utf-8")
+    graph = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path)
+    count = graph.invoke({"messages": [HumanMessage(content="How many records are in the table, including missing values?")]})
+    count_step, = tool_trace(count["messages"])
+    assert count_step["tool"] == "count_rows"
+    assert count_step["evidence"]["row_count"]["rows"] == 4
+    assert "**4 records**" in count["messages"][-1].text
+
+    totals = graph.invoke({"messages": [HumanMessage(content="What is the total units sold by zone? Text only.")]})
+    step, = tool_trace(totals["messages"])
+    assert step["tool"] == "average_by_group" and step["parameters"]["aggregation"] == "sum"
+    grouped = step["evidence"]["group_summary"]
+    assert grouped["groups"] == [
+        {"group": "South", "value": 65, "valid_rows": 2},
+        {"group": "North", "value": 10, "valid_rows": 1},
+    ]
+    assert "**65**" in totals["messages"][-1].text
+    assert totals["validation"][-1]["status"] == count["validation"][-1]["status"] == "passed"
+    assert not list(tmp_path.glob("*.png"))
+
+    chart = graph.invoke({"messages": [HumanMessage(content="Plot the total units sold by zone.")]})
+    step, = tool_trace(chart["messages"])
+    assert step["tool"] == "group_report" and step["parameters"]["aggregation"] == "sum"
+    assert step["evidence"]["group_summary"] == grouped
+    assert chart["validation"][-1]["status"] == "passed"
+    assert len(list(tmp_path.glob("*.png"))) == 1
+
+
+def test_top_rows_preserves_ties_and_projection_with_missing_values(tmp_path):
+    csv = tmp_path / "inventory.csv"
+    csv.write_text("sku,cost,notes\nA,80,one\nB,,two\nC,120,three\nD,80,four\nE,75,five\n", encoding="utf-8")
+    model = ScriptedModel([])
+
+    class Interpreter:
+        def invoke(self, _):
+            return ScopeLabels(clauses=[], row_task={"action": "rank_rows", "columns": ["sku"],
+                                                    "sort_column": "cost", "limit": 3})
+
+    model.with_structured_output = lambda schema: Interpreter()
+    result = build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="List the top 3 original rows by cost and show the sku only, no chart."),
+    ]})
+    step, = tool_trace(result["messages"])
+    ranked = step["evidence"]["ranked_rows"]
+    assert ranked["columns"] == ["sku"]
+    assert [item["sku"] for item in ranked["rows"]] == ["C", "A", "D"]
+    assert ranked["row_ids"] == [2, 0, 3]
+    assert ranked["working_rows"] == 5 and ranked["rows_with_sort_value"] == 4
+    assert result["validation"][-1]["status"] == "passed"
+
+
+def test_overall_total_validation_rejects_a_wrong_number(tmp_path, monkeypatch):
+    csv = tmp_path / "storage.csv"
+    csv.write_text("weight_kg\n10\n50\n8\n", encoding="utf-8")
+    numeric = rows.finite_numbers
+    monkeypatch.setattr(rows, "finite_numbers", lambda series: numeric(series).iloc[:-1])
+    graph = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path)
+    result = graph.invoke({"messages": [HumanMessage(content="Find the total weight kg.")]})
+    attempt, = result["validation"]
+    assert attempt["status"] == "failed"
+    assert "68" in next(check["detail"] for check in attempt["checks"] if check["label"] == "独立复算")
+    assert "**60**" not in result["messages"][-1].text
+    assert not list(tool_artifacts(result["messages"], result["rejected_tool_calls"]))
+
+
+@pytest.mark.parametrize(("zone", "working_rows"), [("Missing", 0), ("North", 1)])
+def test_empty_numeric_scope_does_not_report_an_unverified_total(tmp_path, zone, working_rows):
+    csv = tmp_path / "inventory.csv"
+    csv.write_text("zone,stock\nNorth,\nSouth,40\n", encoding="utf-8")
+    result = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content=f"Only zone = {zone}, calculate the total stock."),
+    ]})
+    step = tool_trace(result["messages"])[-1]
+    assert step["evidence"]["column_statistic"] == {
+        "value_column": "stock", "statistic": "sum", "value": None, "valid_rows": 0, "working_rows": working_rows,
+    }
+    assert "No usable numeric values" in result["messages"][-1].text
+    assert result["validation"][-1]["status"] == "passed"
 
 
 def test_ollama_can_use_an_installed_model_without_an_openai_key(monkeypatch):
@@ -107,7 +269,7 @@ def test_failed_tool_call_can_be_corrected(tmp_path):
         AIMessage(content="BISHAN has the highest average price."),
     ])
     agent = build_agent(model, output_dir=tmp_path)
-    result = agent.invoke({"messages": [{"role": "user", "content": "Chart average resale price by town."}]})
+    result = agent.invoke({"messages": [{"role": "user", "content": "Plot how typical prices compare across towns."}]})
     error, success = [message for message in result["messages"] if isinstance(message, ToolMessage)]
     assert error.status == "error" and error.artifact is None
     assert "Invalid columns" in error.content
@@ -422,8 +584,8 @@ def test_validation_rejects_chart_for_wrong_scope_and_retries_once(tmp_path, rec
     artifacts = list(tool_artifacts(result["messages"], result["rejected_tool_calls"]))
     if recover:
         report, = (artifact for artifact in artifacts if "path" in artifact)
-        assert report["group_summary"]["groups"] == [{"group": "hardware", "value": 20.0}]
-        assert result["messages"][-1].text == "均价是 20。"
+        assert report["group_summary"]["groups"] == [{"group": "hardware", "value": 20.0, "valid_rows": 2}]
+        assert "最高值为 **20**" in result["messages"][-1].text
     else:
         assert all("path" not in artifact for artifact in artifacts)
         assert "校验未通过" in result["messages"][-1].text
@@ -487,6 +649,70 @@ def test_scope_resolves_a_new_domain_using_only_observed_values():
     ungrounded = resolve_observed_labels(question, parsed, table,
                                         lambda _: ScopeLabels(clauses=[{"phrase": "北部", "choices": [999]}]))
     assert ungrounded == parsed
+
+
+def test_conversational_rank_and_count_use_row_tools_and_inherit_scope(tmp_path):
+    csv = tmp_path / "catalog.csv"
+    pd.DataFrame({"area": ["North", "North", "North", "South"], "material": ["Copper", "Copper", "Aluminum", "Copper"],
+                  "item": ["A", "B", "C", "D"], "vendor": ["W", "X", "Y", "Z"],
+                  "cost": [40, None, 150, 200]}).to_csv(csv, index=False)
+    model = ScriptedModel([])
+
+    class Interpreter:
+        def invoke(self, prompt):
+            data = json.loads(prompt.split("\n", 1)[1])
+            if "一共" in data["question"]:
+                return ScopeLabels(clauses=[], row_task={"action": "count_rows"})
+            choices = {item["value"]: item["id"] for item in data["observed_choices"]}
+            return ScopeLabels(clauses=[{"phrase": "北部", "choices": [choices["North"]]},
+                                        {"phrase": "铜", "choices": [choices["Copper"]]}],
+                               row_task={"action": "rank_rows", "sort_column": "cost", "columns": ["item", "vendor"], "limit": 3})
+
+    model.with_structured_output = lambda schema: Interpreter()
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    result = graph.invoke({"messages": [HumanMessage(content="我在北部找铜材，列出成本最高的三个产品和供货商，不用画图")]})
+    steps = tool_trace(result["messages"])
+    assert [step["tool"] for step in steps] == ["filter_rows", "filter_rows", "rank_rows"]
+    assert steps[-1]["evidence"]["ranked_rows"]["rows"] == [{"item": "A", "vendor": "W", "cost": 40.0}]
+    assert result["validation"][-1]["status"] == "passed"
+    assert result["request_scope"]["text_only"] and not result["request_scope"]["unresolved"]
+    history = result["messages"]
+    result = graph.invoke({"messages": [*history, HumanMessage(content="这些一共有几条？缺成本的也算，只要文字")],
+                           "prepared": result["prepared"]})
+    step, = tool_trace(result["messages"][len(history):])
+    assert step["tool"] == "count_rows" and step["evidence"]["row_count"] == {"rows": 2}
+    assert "**2 条**" in result["messages"][-1].text
+    assert not result["request_scope"]["unresolved"]
+
+
+def test_group_counts_come_from_the_tool_when_model_guesses_counts(tmp_path):
+    csv = tmp_path / "groups.csv"
+    pd.DataFrame({"group": ["A"] * 4 + ["B"] * 3 + ["C"] * 2,
+                  "score": [1, 2, 3, 4, 1, 2, None, 4, None]}).to_csv(csv, index=False)
+    model = ScriptedModel([
+        call_tool("group_report", "grouped", group_column="group", value_column="score"),
+        AIMessage(content="各组有效样本数分别是 3、3、3。"),
+    ])
+    result = build_agent(model, csv_path=csv, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="按组画平均分的图。"),
+    ]})
+    step, = tool_trace(result["messages"])
+    groups = step["evidence"]["group_summary"]["groups"]
+    assert {group["group"]: group["valid_rows"] for group in groups} == {"A": 4, "B": 2, "C": 1}
+    assert "3、3、3" not in result["messages"][-1].text and "**7 条**" in result["messages"][-1].text
+
+
+def test_simple_group_answer_cannot_invent_the_maximum(tmp_path):
+    model = ScriptedModel([
+        call_tool("group_report", "grouped", group_column="town", value_column="resale_price"),
+        AIMessage(content="最高均价是 999,999。"),
+    ])
+    result = build_agent(model, output_dir=tmp_path).invoke({"messages": [
+        HumanMessage(content="帮我画各镇转售价的平均值。"),
+    ]})
+    assert result["validation"][-1]["status"] == "passed"
+    assert all(text in result["messages"][-1].text for text in ("BISHAN", "**820,000**"))
+    assert "999,999" not in result["messages"][-1].text
 
 
 def test_scope_is_partial_if_part_of_the_request_is_unresolved(tmp_path):
@@ -620,7 +846,7 @@ def test_tool_loop_finishes_at_the_budget(tmp_path):
         AIMessage(content="The CSV contains six rows."),
     ])
     agent = build_agent(model, output_dir=tmp_path)
-    result = agent.invoke({"messages": [{"role": "user", "content": "Show the row count."}]})
+    result = agent.invoke({"messages": [{"role": "user", "content": "Describe the table's data types."}]})
     assert result["tool_turns"] == MAX_TOOL_TURNS
     assert "budget is exhausted" in model.prompts[-1]
     assert result["messages"][-1].content == "The CSV contains six rows."

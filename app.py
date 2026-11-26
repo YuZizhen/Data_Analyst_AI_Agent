@@ -371,9 +371,15 @@ def show_turn(turn: Turn):
             elif last == "limited" and any(check.get("scope_comparison", {}).get("status") == "limited"
                                           for check in validation[-1]["checks"]):
                 st.caption("筛选范围只核对了一部分。打开「校验结果」查看哪些条件尚待确认。")
-        for artifact in tool_artifacts(turn.messages):
+        for artifact in tool_artifacts(turn.messages, (trace or {}).get("rejected_tool_calls", [])):
             if "table" in artifact:
                 show_preview(pd.DataFrame(**artifact["table"]), artifact["total_rows"])
+            if groups := artifact.get("group_summary"):
+                st.dataframe(pd.DataFrame(groups["groups"]).rename(columns={
+                    "group": "分组", "value": "统计值", "valid_rows": "参与统计的有效行数",
+                }), hide_index=True, width="stretch")
+            if ranked := artifact.get("ranked_rows"):
+                st.dataframe(pd.DataFrame(ranked["rows"], columns=ranked["columns"]), hide_index=True, width="stretch")
         for report in turn.reports:
             with st.container(border=True):
                 with st.container(key=f"report-image-{Path(report.filename).stem}"):

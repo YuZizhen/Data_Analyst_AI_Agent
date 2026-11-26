@@ -1,5 +1,6 @@
 """Deterministic evidence checks used by the analysis graph before publishing a reply."""
 
+import json
 import re
 from collections import defaultdict
 from hashlib import sha256
@@ -11,11 +12,13 @@ from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import ToolException
 
 from src.tools.dataset import finite_numbers
+from src.tools.formulas import formula_values
 from src.tools.preprocessing import PREPARATION_FUNCTIONS, filter_frame
 
 NUMERIC_TOOLS = {
     "average_by_group", "group_report", "trend_report", "distribution_report",
     "rank_relationships", "relationship_report", "group_distribution_report", "feature_importance_report", "evaluate_prediction", "predict_value",
+    "count_rows", "rank_rows", "aggregate_column", "formula_group_totals",
 }
 CLAIM = re.compile(r"导致|显著(?:影响|相关|提高|降低)|决定了|证明.{0,10}因果|\bcaus(?:e[ds]?|ally)\b|statistically significant", re.I)
 RANK_OVERCLAIM = re.compile(r"(?:最为?显著|影响(?:最强|最大)|most significant|greatest impact)", re.I)
@@ -109,35 +112,42 @@ def verify_requested_scope(source, frame, steps, inherited, request, tool, suppl
 
 
 def check_groups(frame: pd.DataFrame, args: dict, evidence: dict) -> tuple[bool, str]:
-    aggregation = args.get("aggregation", "mean")
-    values = [1] * len(frame) if aggregation == "count" else finite_numbers(frame[args["value_column"]])
+    expression = args.get("expression")
+    aggregation = "sum" if expression is not None else args.get("aggregation", "mean")
+    if expression is not None:
+        values = formula_values(frame, expression)
+    else:
+        values = [1] * len(frame) if aggregation == "count" else finite_numbers(frame[args["value_column"]])
     groups = defaultdict(list)
     for label, value in zip(frame[args["group_column"]], values):
         if pd.notna(value):
             groups[None if pd.isna(label) else label].append(float(value))
     calculate = {"mean": mean, "median": median, "sum": fsum, "count": len}[aggregation]
     expected = sorted(
-        (("(Missing)" if name is None else str(name), calculate(items)) for name, items in groups.items()),
+        (("(Missing)" if name is None else str(name), calculate(items), len(items)) for name, items in groups.items()),
         key=lambda item: item[1], reverse=True,
     )
     ranking = expected[:args.get("top_n", 10)]
     reported = evidence["groups"]
     matches = (
         evidence["working_rows"] == len(frame) and evidence["group_count"] == len(expected)
+        and evidence["aggregation"] == aggregation and evidence["group_column"] == args["group_column"]
+        and evidence["value_column"] == args.get("value_column")
+        and evidence.get("expression") == expression
         and evidence["rows_used"] == sum(map(len, groups.values())) and len(reported) == len(ranking)
-        and all(isclose(row["value"], value, rel_tol=1e-9, abs_tol=1e-9) for row, (_, value) in zip(reported, ranking))
+        and all(isclose(row["value"], value, rel_tol=1e-9, abs_tol=1e-9) for row, (_, value, _) in zip(reported, ranking))
     )
     if matches:
         # Match a reported row at most once, including when the display label is ambiguous.
         remaining = expected.copy()
         for row in reported:
-            index = next((i for i, (name, value) in enumerate(remaining) if row["group"] == name
+            index = next((i for i, (name, value, size) in enumerate(remaining) if row["group"] == name and row["valid_rows"] == size
                           and isclose(row["value"], value, rel_tol=1e-9, abs_tol=1e-9)), None)
             if index is None:
                 matches = False
                 break
             remaining.pop(index)
-    example = "、".join(f"{name} {value:,.6g}" for name, value in ranking[:3])
+    example = "、".join(f"{name} {value:,.6g}（有效 {size:,} 行）" for name, value, size in ranking[:3])
     summary = f"用 Python 逐组重算了 {len(expected):,} 组，涉及 {sum(map(len, groups.values())):,} 行。"
     return matches, summary + (f"复算值示例：{example}。" if example else "")
 
@@ -167,8 +177,43 @@ def check_distribution(frame: pd.DataFrame, args: dict, evidence: dict) -> tuple
     return matches, f"独立核对了 {len(values):,} 个值，中位数 {expected['median']:,.6g}，范围 {expected['min']:,.6g} 至 {expected['max']:,.6g}。"
 
 
+def check_row_count(frame, args, evidence):
+    rows = len(frame.index)
+    return evidence["rows"] == rows, f"重新计数得到 {rows:,} 行，包含有缺失值的记录。"
+
+
+def check_column_statistic(frame, args, evidence):
+    series = finite_numbers(frame[args["value_column"]]).dropna()
+    values = series.tolist()
+    operation = args["statistic"]
+    calculate = {"sum": sum if series.dtype.kind in "iu" else fsum, "mean": mean, "median": median, "min": min, "max": max}
+    expected = calculate[operation](values) if values else None
+    actual = evidence["value"]
+    if isinstance(expected, int) or expected is None:
+        equal = expected == actual
+    else:
+        equal = actual is not None and isclose(expected, actual, rel_tol=1e-9, abs_tol=1e-9)
+    matches = (equal and evidence["valid_rows"] == len(values) and evidence["working_rows"] == len(frame)
+               and evidence["statistic"] == operation and evidence["value_column"] == args["value_column"])
+    detail = f"独立核对「{args['value_column']}」的 {operation}，共 {len(values):,} 个有效值"
+    return matches, detail + (f"，结果为 {expected:,}。" if expected is not None else "，没有可计算的数值。")
+
+
+def check_ranked_rows(frame, args, evidence):
+    values = finite_numbers(frame[args["sort_column"]]).dropna()
+    order = sorted(values.items(), key=lambda item: item[1], reverse=not args["ascending"])[:args["limit"]]
+    ids = [index for index, _ in order]
+    fields = list(dict.fromkeys([*args["columns"], args["sort_column"]] if args["include_sort_value"] else args["columns"]))
+    rows = json.loads(frame.loc[ids, fields].to_json(orient="records", date_format="iso", double_precision=15))
+    matches = (evidence["row_ids"] == ids and evidence["columns"] == fields and evidence["rows"] == rows
+               and evidence["working_rows"] == len(frame) and evidence["rows_with_sort_value"] == len(values))
+    return matches, f"对 {len(values):,} 行有效排序值重新排序，核对前 {len(ids):,} 行和所显示的字段。"
+
+
 RECOMPUTE = {
     "group_summary": check_groups, "pairwise_correlation": check_pair, "distribution_summary": check_distribution,
+    "row_count": check_row_count, "ranked_rows": check_ranked_rows,
+    "column_statistic": check_column_statistic,
 }
 
 
@@ -198,6 +243,29 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
     evidence_to_check = []
     for tool in tools:
         evidence = tool.artifact or {}
+        requested = request_scope.get("row_task") or {}
+        action = requested.get("action")
+        keys = {
+            "aggregate_column": ("value_column", "statistic"),
+            "formula_group_totals": ("value_column", "expression", "group_column"),
+            "average_by_group": ("group_column", "value_column", "aggregation"),
+            "group_report": ("group_column", "value_column", "aggregation"),
+            "rank_rows": ("sort_column", "columns", "ascending", "limit"),
+            "count_rows": (),
+        }
+        if action in keys:
+            request = normalize_parameters(calls[tool.tool_call_id]["name"], calls[tool.tool_call_id]["args"])
+            expected = {key: requested[key] for key in keys[action]}
+            if action == "rank_rows" and expected["limit"] is None:
+                expected["limit"] = 10
+            if action == "rank_rows":
+                expected["include_sort_value"] = not request_scope["only_output_fields"]
+            matches = tool.name == action and all(request.get(key) == value for key, value in expected.items())
+            checks.append(check("请求的操作", "passed" if matches else "failed",
+                                f"已核对请求的操作 {action} 及参数。"
+                                + ("工具和参数一致。" if matches else "执行的工具或参数不符。"), tool=tool.name))
+            if not matches:
+                invalid.add(tool.tool_call_id)
         supplied_values = evidence.get("prediction_evaluation", {}).get("estimate", {}).get("inputs", {})
         scope = evidence.get("analysis_scope")
         if scope is None:
@@ -229,7 +297,7 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
                 try:
                     call = calls[tool.tool_call_id]
                     matches, detail = recompute(frame, normalize_parameters(call["name"], call["args"]), evidence[key])
-                except (ArithmeticError, KeyError, TypeError, ValueError):
+                except (ArithmeticError, KeyError, ToolException, TypeError, ValueError):
                     matches, detail = False, "无法根据记录的参数和输入重算这项结果。"
                 checks.append(check("独立复算", "passed" if matches else "failed", detail, tool=tool.name))
                 if not matches:

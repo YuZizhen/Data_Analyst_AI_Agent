@@ -14,6 +14,9 @@ A self-validating data analysis agent built with **LangChain**, **LangGraph**, *
 - Profile missing values and distinct values, inspect labels, filter rows, remove missing or duplicate rows, and convert columns to number, date, or text.
 - Choose an OpenAI API model or a local Ollama model with tool-calling support.
 - Compare groups by mean, median, sum, or row count with a bar chart.
+- Count all records in the active scope, including missing values, or list the original top or bottom records with their requested columns.
+- Execute unambiguous row counts, whole-column statistics, and named grouped statistics directly. Checks cover the requested operation, selected rows, and result. Grouped answers use the tool's results, including each group's usable sample count.
+- Sum user-defined row formulas by group, for example `Calculate total net by category (net = amount * (1 - discount))`. Formulas use column names, numbers, parentheses, and the basic arithmetic operators.
 - Plot a metric over time, its distribution, or its relationship to another numeric metric.
 - Review eligible fields against a numeric target, then rank Pearson correlations for numeric fields and correlation ratios for categorical fields separately, with paired sample sizes.
 - Plot the top N predictive factors for a numeric target with percentage shares and an Other factors bar when needed.
@@ -125,7 +128,9 @@ When validation runs, the progress bubble shows **正在校验**. Open **查看�
 
 | Check | Current coverage |
 | --- | --- |
-| Data scope | Records requested conditions separately from executed filters. Replays cleaning and compares the actual rows with the requested scope. Explicit comparisons and existing category labels can be matched directly. For unresolved phrases, the model can map translations or synonyms to observed category values in the active data, and the record shows the phrase and matched value. A clause that cannot be resolved is marked as partial coverage. |
+| Data scope | Records requested conditions separately from executed filters. Replays cleaning and compares the actual rows with the requested scope. Explicit comparisons can be matched directly. The model also reads the whole conversational request and maps category filters to existing values in the active data. The record shows the phrase and matched value. A clause that cannot be resolved is marked as partial coverage. |
+| Record requests | Counts all rows in the current scope or ranks original records by a numeric field. The execution record shows the row count or the fields and records selected. A request for text or a table suppresses chart tool calls. |
+| Group sizes | Grouped summaries show each group's statistic and the number of valid rows behind it. Those counts are independently checked and displayed from the tool output. |
 | Independent recalculation | Recomputes grouped statistics, pairwise Pearson correlations, and the median and range of distributions. Trends, field association rankings, and feature importance have partial coverage. |
 | Conclusion wording | Scans the draft for common unsupported causal or statistical significance claims. This is a wording check. Cross-checking every number stated in the answer is on the backlog. |
 
