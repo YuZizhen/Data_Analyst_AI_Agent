@@ -345,3 +345,50 @@ def test_browser_can_save_a_filter_in_the_same_request(monkeypatch):
     assert app.selectbox[0].value != original_key and len(store.list()) == 2
     assert turn.trace["working_data"]["saved_version"] == store.list()[app.selectbox[0].value].label
     assert not turn.trace["working_data"]["temporary"]
+
+
+@pytest.mark.parametrize("followup", ["那 Furniture 呢？", "那 Furniture 的均价呢？", "What is the average unit price for Furniture?"])
+def test_chat_clarifies_category_scope_and_shows_the_actual_scope(monkeypatch, followup):
+    store = table_store.TableStore(table_store.DATASET_DIRECTORY)
+    entry = store.save_original("sales.csv", b"category,region,unit_price\nElectronics,North,100\nFurniture,North,50\nFurniture,South,500\n")
+    model = ScriptedModel([])
+    monkeypatch.setattr(agent, "build_model", lambda *args, **kwargs: model)
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=25).run()
+    app.selectbox[0].set_value(entry.key).run()
+    for question in (
+        "Only region = North, category is Electronics. What's the average unit price?",
+        followup,
+    ):
+        app.chat_input[0].set_value(question).run()
+        app.run()
+        assert not app.exception
+    first, clarification = app.session_state.turns
+    assert clarification.trace is None
+    pending = clarification.messages[-1].response_metadata["scope_choice"]
+    assert (pending["kept_rows"], pending["wide_rows"]) == (1, 2)
+    assert app.session_state.working_table.frame["category"].tolist() == ["Electronics"]
+    assert any(button.label == "按所选表的全部范围" for button in app.button)
+    next(button for button in app.button if button.label == "沿用刚才的筛选").click().run()
+    app.run()
+    assert not app.exception
+    assert not any(button.label == "按所选表的全部范围" for button in app.button)
+    app.chat_input[0].set_value("这些记录有几条？").run()
+    app.run()
+    assert not app.exception
+    first, _, second, third = app.session_state.turns
+    assert "**100**" in first.messages[-1].text
+    assert "**50**" in second.messages[-1].text
+    assert "**1 条**" in third.messages[-1].text
+    assert second.trace["request_scope"]["replaced_conditions"][0]["value"] == "Electronics"
+    assert second.trace["request_scope"]["clarified_question"] == followup
+    scope, = second.trace["analysis_ranges"]
+    assert scope["rows"] == 1
+    assert [(item["column_name"], item["value"]) for item in scope["filters"]] == [
+        ("region", "North"), ("category", "Furniture"),
+    ]
+    assert all(turn.trace["validation"][-1]["status"] == "passed" for turn in (first, second, third))
+    assert third.trace["analysis_ranges"] == second.trace["analysis_ranges"]
+    assert any("本轮数据 · sales.csv" in item.value for item in app.caption)
+    assert app.selectbox[0].value == entry.key
+    assert set(store.list()) == {entry.key, next(key for key, table in store.list().items() if table.is_demo)}
+    assert not model.prompts

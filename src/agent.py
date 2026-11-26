@@ -52,9 +52,10 @@ from src.tools import (
 )
 from src.tools.candidates import CONFIRMATION, CANDIDATE_TOOLS, confirmed_fields, review_candidates, review_counts, review_summary
 from src.tools.charts import grouped_answer
-from src.tools.dataset import numeric_column
+from src.tools.dataset import finite_numbers, numeric_column
 from src.tools.rows import statistic_answer
-from src.request_scope import RankFields, ScopeLabels, parse_request_scope, resolve_observed_labels, resolve_rank_fields
+from src.request_scope import DELIMITER, RankFields, ScopeLabels, category_followup, parse_request_scope, resolve_observed_labels, resolve_rank_fields
+from src.tools.preprocessing import PREPARATION_FUNCTIONS, filter_frame
 from src.validation import NUMERIC_TOOLS, analysis_scope, frame_signature, validate_results
 
 load_dotenv()
@@ -81,6 +82,19 @@ FORMAT_CORRECTION = re.compile(
     r"(?:it(?: is|'s)|this is|that is) not a (?:summary|breakdown)|(?:no|not a) (?:summary|breakdown)"
     r"|(?:不用|不要)分组", re.I,
 )
+KEEP_SCOPE = re.compile(r"(?:沿用|保留)(?:之前的?|当前的?|刚才的?)?(?:范围|筛选)|(?:就在|按|基于)当前范围"
+                        r"|\b(?:in|within|keep|use) (?:the )?(?:current|previous|same) (?:scope|filters?|selection)\b", re.I)
+CURRENT_RECORDS = re.compile(r"(?:这些|这批|刚才的)(?:记录|数据|结果)")
+WIDE_SCOPE = re.compile(r"(?:按|用)(?:所选表|选中表)的全部范围|所有(?:地区|区域)|全部(?:地区|区域)"
+                        r"|\b(?:across |in |for )?all (?:regions|areas|locations)\b|\b(?:use )?the whole selected table\b", re.I)
+SCOPE_CHOICES = {
+    "keep": {"沿用刚才的筛选", "沿用之前的筛选", "沿用当前筛选", "保留当前筛选", "只算当前范围",
+             "keep the previous filters", "keep the current filters", "keep filters"},
+    "wide": {"按所选表的全部范围", "全部范围", "用全部范围", "所有地区", "全部地区", "全部", "全部计算", "算全部",
+             "use the whole selected table", "all regions", "the whole selected table"},
+}
+SCOPE_COMPARISONS = {"equals": "=", "not_equals": "≠", "greater_than": ">", "at_least": "≥",
+                     "less_than": "<", "at_most": "≤"}
 MODEL_ERRORS = (OpenAIError, ResponseError, ConnectionError, RequestError)
 MODEL_DEFAULTS = {"ollama": ("OLLAMA_MODEL", "qwen3.5:4b"), "openai": ("OPENAI_MODEL", "gpt-4o-mini")}
 ANALYSIS_TOOLS = [
@@ -196,6 +210,7 @@ report paths. Do not guess or repeat file paths."""
 
 class AnalysisInput(MessagesState):
     prepared: NotRequired[PreparedDataset | None]
+    selected_version: NotRequired[PreparedDataset | None]
 
 
 class AnalysisState(AnalysisInput):
@@ -209,6 +224,7 @@ class AnalysisState(AnalysisInput):
     input_working_table: PreparedDataset | None
     row_plan: list[tuple[str, dict]]
     row_step: int
+    pending_scope_choice: dict | None
 
 
 def messages_for_model(messages, rejected=()):
@@ -217,6 +233,106 @@ def messages_for_model(messages, rejected=()):
         if isinstance(message, ToolMessage) and message.tool_call_id in rejected else message
         for message in messages
     ]
+
+
+def previous_scope_result(messages):
+    for message in reversed(messages[:-1]):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, ToolMessage) and message.status == "success":
+            artifact = message.artifact or {}
+            if "column_statistic" in artifact or "row_count" in artifact:
+                return artifact
+    return None
+
+
+def rebase_analysis_filters(source, prepared, selected, request_scope, *, broaden=False):
+    if prepared is None or request_scope["reset"] or request_scope["unresolved"] or request_scope["has_alternatives"]:
+        return prepared, []
+    requested = [{key: condition[key] for key in ("column_name", "operator", "value")}
+                 for condition in request_scope["conditions"] if condition["source"] != "record_input"]
+    replacements = {condition["column_name"]: condition for condition in requested
+                    if condition["operator"] in {"equals", "in"}}
+    if not replacements and not broaden:
+        return prepared, []
+    protected = len(selected.steps) if selected and prepared.steps[:len(selected.steps)] == selected.steps else 0
+    kept, removed = [], []
+    for index, step in enumerate(prepared.steps):
+        params = step["parameters"]
+        replacement = replacements.get(params.get("column_name"))
+        changed = replacement and params.get("operator") in {"equals", "in"} and (
+            params["operator"], params["value"]
+        ) != (replacement["operator"], replacement["value"])
+        if index >= protected and step["tool"] == "filter_rows" and (params not in requested if broaden else changed):
+            removed.append(params)
+        else:
+            kept.append(step)
+    if not removed:
+        return prepared, []
+    frame = source
+    rebased = []
+    for step in kept:
+        before = len(frame)
+        frame = PREPARATION_FUNCTIONS[step["tool"]](frame, **step["parameters"])
+        rebased.append({**step, "rows_before": before, "rows_after": len(frame)})
+    return (PreparedDataset(frame, tuple(rebased)) if rebased else None), removed
+
+
+def scope_choice_reply(messages, prepared):
+    if len(messages) < 2 or not isinstance(messages[-2], AIMessage):
+        return None, None
+    pending = messages[-2].response_metadata.get("scope_choice")
+    if not pending or pending["steps"] != list(prepared.steps if prepared is not None else ()):
+        return None, None
+    answer = messages[-1].text.strip().rstrip("。.!！?？").casefold()
+    choice = next((name for name, labels in SCOPE_CHOICES.items() if answer in labels), None)
+    if choice is None and len(pending["filters"]) == 1:
+        condition = pending["filters"][0]
+        if condition["operator"] == "equals":
+            label = re.escape(str(condition["value"]).casefold())
+            if re.fullmatch(rf"(?:只算|只看|按|only |just )?\s*{label}\s*(?:算|地区|区域)?", answer):
+                choice = "keep"
+    return choice, pending if choice else None
+
+
+def strip_scope_modifier(question, pattern):
+    quoted = [match.span() for match in DELIMITER.finditer(question) if match[1]]
+    matches = [match.span() for match in pattern.finditer(question)
+               if not any(left < match.end() and match.start() < right for left, right in quoted)]
+    for start, end in reversed(matches):
+        question = question[:start] + " " + question[end:]
+    return bool(matches), question.strip(" ，,。.!！?？") if matches else question
+
+
+def compare_requested_ranges(source, prepared, selected, scope):
+    kept, replaced = rebase_analysis_filters(source, prepared, selected, scope)
+    wide, cleared = rebase_analysis_filters(source, prepared, selected, scope, broaden=True)
+    kept_steps = kept.steps if kept is not None else ()
+    wide_steps = wide.steps if wide is not None else ()
+    if kept_steps == wide_steps:
+        return None
+
+    def requested_frame(table):
+        frame = table.frame if table is not None else source
+        for condition in scope["conditions"]:
+            if condition["source"] != "record_input":
+                frame = filter_frame(frame, condition["column_name"], condition["operator"], condition["value"])
+        return frame
+
+    try:
+        narrow_frame, wide_frame = requested_frame(kept), requested_frame(wide)
+    except ToolException:
+        return None
+    if narrow_frame.empty or wide_frame.empty or narrow_frame.index.equals(wide_frame.index):
+        return None
+    task = scope["row_task"]
+    measure = {"aggregate_column": "value_column", "rank_rows": "sort_column"}.get(task["action"])
+    if measure:
+        field = task[measure]
+        if any(field not in frame or not finite_numbers(frame[field]).notna().any() for frame in (narrow_frame, wide_frame)):
+            return None
+    return {"kept_rows": len(narrow_frame), "wide_rows": len(wide_frame),
+            "filters": [item for item in cleared if item not in replaced]}
 
 
 def preview_request_language(text: str) -> str:
@@ -489,8 +605,11 @@ def build_analysis_graph(model, context: AnalysisContext):
                 "content": f"{result.text}\n\n{review_summary(review.evidence)}",
                 "artifact": {**(result.artifact or {}), "candidate_review": review.evidence},
             })
-        if call["name"] in NUMERIC_TOOLS and isinstance(result, ToolMessage) and result.status == "success":
-            scope = analysis_scope(working_frame(context, request.state), request.state.get("prepared"))
+        if call["name"] in NUMERIC_TOOLS | INSPECTION_NAMES and isinstance(result, ToolMessage) and result.status == "success":
+            frame = working_frame(context, request.state)
+            prepared = request.state.get("prepared")
+            scope = (analysis_scope(frame, prepared) if call["name"] in NUMERIC_TOOLS else
+                     {"rows": len(frame), "steps": list(prepared.steps) if prepared else []})
             result = result.model_copy(update={"artifact": {**(result.artifact or {}), "analysis_scope": scope}})
         return result
 
@@ -498,10 +617,26 @@ def build_analysis_graph(model, context: AnalysisContext):
         question = next((message.text for message in reversed(state["messages"]) if isinstance(message, HumanMessage)), "")
         prepared = state.get("prepared")
         frame = working_frame(runtime.context, state)
-        scope = parse_request_scope(question, frame)
-        if prepared is not None and scope["reset"]:
-            frame = runtime.context.dataset
-            scope = parse_request_scope(question, frame)
+        selected = state.get("selected_version")
+        reference = selected.frame if selected is not None else runtime.context.dataset
+        choice, pending = scope_choice_reply(state["messages"], prepared)
+        explicit_wide, parse_question = strip_scope_modifier(question, WIDE_SCOPE)
+        explicit_keep, parse_question = strip_scope_modifier(parse_question, KEEP_SCOPE)
+        explicit_keep = explicit_keep or bool(CURRENT_RECORDS.search(question))
+        if pending:
+            scope = {**pending["scope"], "scope_choice": choice, "clarified_question": pending["question"]}
+        else:
+            scope = parse_request_scope(parse_question, frame, labels_frame=reference)
+        if scope["reset"]:
+            reference = runtime.context.dataset
+            frame = reference
+            scope = parse_request_scope(question, reference)
+        if prepared and not pending and not scope["reset"] and not scope["conditions"] and not scope["unresolved"]:
+            filters, task = category_followup(parse_question, reference, prepared.steps, previous_scope_result(state["messages"]))
+            if filters:
+                scope["conditions"] = filters
+                if task is not None:
+                    scope.update(row_task=task, row_action=task["action"], direct_measure=True)
         if FORMAT_CORRECTION.fullmatch(question.strip().rstrip("。.!！?？")):
             prior = [message.text for message in state["messages"] if isinstance(message, HumanMessage)]
             if len(prior) > 1:
@@ -509,10 +644,10 @@ def build_analysis_graph(model, context: AnalysisContext):
                 task = previous_scope["row_task"]
                 if previous_scope["direct_measure"] and task:
                     scope = {**scope, "row_task": task, "row_action": task["action"], "direct_measure": True}
-        if (not scope["direct_measure"] and not preview_request_language(question) and not scope["has_alternatives"] and hasattr(model, "with_structured_output")
+        if (not pending and not scope["direct_measure"] and not preview_request_language(question) and not scope["has_alternatives"] and hasattr(model, "with_structured_output")
                 and not ranking_chart_requests(state["messages"], frame) and not previous_call_for_confirmation(state["messages"])):
             try:
-                scope = resolve_observed_labels(question, scope, frame, model.with_structured_output(ScopeLabels).invoke)
+                scope = resolve_observed_labels(parse_question, scope, reference, model.with_structured_output(ScopeLabels).invoke)
             except (*MODEL_ERRORS, NotImplementedError, ValueError):
                 # The unresolved phrases remain visible as partial coverage.
                 pass
@@ -521,6 +656,20 @@ def build_analysis_graph(model, context: AnalysisContext):
                 scope["row_task"] = resolve_rank_fields(question, frame, model.with_structured_output(RankFields).invoke)
             except (*MODEL_ERRORS, NotImplementedError, ValueError):
                 pass
+        starting_prepared = prepared
+        if (not pending and not explicit_keep and not explicit_wide and prepared is not None
+                and scope["row_task"] and any(item["source"] != "record_input" for item in scope["conditions"])):
+            comparison = compare_requested_ranges(runtime.context.dataset, prepared, selected, scope)
+            if comparison:
+                pending = {**comparison, "question": question, "steps": list(prepared.steps), "scope": scope}
+                return {"request_scope": scope, "pending_scope_choice": pending, "row_plan": [], "row_step": 0,
+                        "input_preparation": list(prepared.steps), "input_working_table": starting_prepared}
+        prepared, replaced = rebase_analysis_filters(
+            runtime.context.dataset, prepared, selected, scope, broaden=bool(choice == "wide" or explicit_wide),
+        )
+        if replaced:
+            scope["replaced_conditions"] = replaced
+            frame = prepared.frame if prepared is not None else runtime.context.dataset
         plan = []
         if (task := scope.get("row_task")) and not scope["unresolved"]:
             if task["action"] == "count_rows":
@@ -551,10 +700,14 @@ def build_analysis_graph(model, context: AnalysisContext):
                 if scope["show_filtered_rows"]:
                     plan.append(("dataset_preview", {}))
                 plan.append(result)
-        return {"request_scope": scope, "row_plan": plan, "row_step": 0,
-                "input_preparation": list(prepared.steps) if prepared else [], "input_working_table": prepared}
+        return {"request_scope": scope, "pending_scope_choice": None, "row_plan": plan, "row_step": 0, "prepared": prepared,
+                "input_preparation": list(prepared.steps) if prepared else [], "input_working_table": starting_prepared}
 
     def entry(state: AnalysisState):
+        if state["pending_scope_choice"]:
+            return "clarify_scope"
+        if state["request_scope"].get("scope_choice") and state["row_plan"]:
+            return "execute_row_step"
         messages = state["messages"]
         message = messages[-1] if messages else None
         if isinstance(message, HumanMessage) and preview_request_language(message.text):
@@ -569,6 +722,21 @@ def build_analysis_graph(model, context: AnalysisContext):
             return "row_answer"
         return "analyst"
 
+    def clarify_scope(state: AnalysisState):
+        pending = state["pending_scope_choice"]
+        filters = ", ".join(f"`{item['column_name']}` {SCOPE_COMPARISONS.get(item['operator'], item['operator'])} **{item['value']}**"
+                            for item in pending["filters"])
+        kept, wide = pending["kept_rows"], pending["wide_rows"]
+        if re.search(r"[\u3400-\u9fff]", pending["question"]):
+            answer = (f"这次要沿用刚才的筛选（{filters}），还是按所选表的全部范围计算？\n\n"
+                      f"- 沿用刚才的筛选，匹配 **{kept:,} 条**\n"
+                      f"- 按所选表的全部范围，匹配 **{wide:,} 条**")
+        else:
+            answer = (f"Should I keep the previous filters ({filters}) or use the whole selected table?\n\n"
+                      f"- Keep the previous filters · **{kept:,}** matching rows\n"
+                      f"- Use the whole selected table · **{wide:,}** matching rows")
+        return {"messages": [AIMessage(content=answer, response_metadata={"scope_choice": pending})]}
+
     def execute_row_step(state: AnalysisState):
         step = state["row_step"]
         name, args = state["row_plan"][step]
@@ -577,7 +745,9 @@ def build_analysis_graph(model, context: AnalysisContext):
 
     def row_answer(state: AnalysisState):
         messages = state["messages"]
-        question = next(message.text for message in reversed(messages) if isinstance(message, HumanMessage))
+        question = state["request_scope"].get("clarified_question") or next(
+            message.text for message in reversed(messages) if isinstance(message, HumanMessage)
+        )
         chinese = bool(re.search(r"[\u3400-\u9fff]", question))
         last = messages[-1]
         artifact = (last.artifact or {}) if isinstance(last, ToolMessage) and last.status == "success" else {}
@@ -708,6 +878,15 @@ def build_analysis_graph(model, context: AnalysisContext):
             request_scope=state["request_scope"], input_preparation=state["input_preparation"],
         )
         if not checks:
+            if state["request_scope"].get("replaced_conditions"):
+                turn_messages = []
+                for message in reversed(state["messages"]):
+                    if isinstance(message, HumanMessage):
+                        break
+                    turn_messages.append(message)
+                if not any(isinstance(message, ToolMessage) and message.name == "filter_rows" and message.status == "success"
+                           for message in turn_messages):
+                    return {"prepared": state["input_working_table"]}
             return {}
         previous = state.get("validation", [])
         statuses = {item["status"] for item in checks}
@@ -754,6 +933,7 @@ def build_analysis_graph(model, context: AnalysisContext):
     graph = (
         StateGraph(AnalysisState, context_schema=AnalysisContext, input_schema=AnalysisInput)
         .add_node("read_request", read_request)
+        .add_node("clarify_scope", clarify_scope)
         .add_node("analyst", analyst)
         .add_node("request_preview", request_preview)
         .add_node("rerun_confirmed", rerun_confirmed)
@@ -765,7 +945,9 @@ def build_analysis_graph(model, context: AnalysisContext):
         .add_node("validate", validate)
         .add_edge(START, "read_request")
         .add_conditional_edges("read_request", entry,
-                               ["request_preview", "rerun_confirmed", "chart_ranking", "analyst", "execute_row_step", "row_answer"])
+                               ["clarify_scope", "request_preview", "rerun_confirmed", "chart_ranking", "analyst",
+                                "execute_row_step", "row_answer"])
+        .add_edge("clarify_scope", END)
         .add_edge("request_preview", "tools")
         .add_edge("rerun_confirmed", "tools")
         .add_edge("chart_ranking", "tools")
@@ -779,9 +961,13 @@ def build_analysis_graph(model, context: AnalysisContext):
     return graph.compile().bind(context=context)
 
 
-def print_answer(agent, question: str, prepared: PreparedDataset | None = None) -> PreparedDataset | None:
-    result = agent.invoke({"messages": [{"role": "user", "content": question}], "prepared": prepared})
-    messages = result["messages"]
+def print_answer(agent, question: str, prepared: PreparedDataset | None = None, *,
+                 scope_prompt: list[AIMessage] | None = None) -> PreparedDataset | None:
+    history = scope_prompt or []
+    result = agent.invoke({"messages": [*history, HumanMessage(content=question)], "prepared": prepared})
+    messages = result["messages"][len(history):]
+    if scope_prompt is not None:
+        scope_prompt[:] = [messages[-1]] if result.get("pending_scope_choice") else []
     print(f"\nAnswer:\n{messages[-1].text}")
     for step in tool_trace(messages, result.get("rejected_tool_calls", [])):
         if review := step.get("evidence", {}).get("candidate_review"):
@@ -906,6 +1092,7 @@ def main():
 
     print("AI Data Analyst Agent (type 'quit' to exit)")
     prepared = None
+    scope_prompt = []
     while True:
         try:
             question = input("\nQuestion: ").strip()
@@ -915,7 +1102,7 @@ def main():
             return
         if question:
             try:
-                prepared = print_answer(agent, question, prepared)
+                prepared = print_answer(agent, question, prepared, scope_prompt=scope_prompt)
             except MODEL_ERRORS as error:
                 print(model_error_message(error))
 

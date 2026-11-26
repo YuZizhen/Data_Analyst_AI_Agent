@@ -26,6 +26,7 @@ EXPLICIT_ROW_COUNT = re.compile(
     r"(?:how many (?:rows|records)|(?:row|record) count|count (?:all |the )?(?:rows|records)|"
     r"(?:总行数|记录总数|统计行数|统计记录数))", re.I,
 )
+REFERENCE_COUNT = re.compile(r"(?:这些|当前(?:的)?)(?:数据|记录|行)(?:一共|总共)?有?(?:几条|几行|多少(?:条|行))\s*[。！？?!.]*")
 ONLY_OUTPUT_FIELDS = re.compile(
     r"\b(?:show|display|return|include)\s+only\s+(?!the\s+(?:top|bottom)\b)"
     r"|\b(?:show|display|return|include)\s+[^,，。?!]+?\s+only(?=\s*[,，。.!?]|$)"
@@ -47,6 +48,8 @@ MEASURE_WORDS = {
 }
 GROUP_COUNT = re.compile(r"\bnumber of (?:rows|records)\b|(?:行数|记录数)", re.I)
 CHART_REQUEST = re.compile(r"\b(?:plot|chart|graph|draw)\b|(?:绘制|画)(?:一张)?|柱状图|图表", re.I)
+FOLLOWUP_PREFIX = re.compile(r"^(?:(?:那么|那|再看)\s*|(?:and\s+)?(?:what|how)\s+about\s+|and\s+)", re.I)
+FOLLOWUP_STATISTIC = re.compile(r"^(?:的)?(?:均价|平均(?:值|单价)?|average|mean)?$", re.I)
 MULTI_RESULT = re.compile(
     r"分组|每(?:组|类|个|月|天|年|周)|各|按|趋势|图|预测|比例|占比|差值|相比|对比|最高的.{0,4}(?:条|名|个)"
     r"|\b(?:by|per|each|group|trend|forecast|predict|plot|chart|compare|versus|ratio|share|difference|which)\b", re.I,
@@ -257,7 +260,35 @@ def label_conditions(text: str, frame) -> tuple[list[dict], str]:
     return conditions, " ".join(pieces)
 
 
-def parse_request_scope(question: str, frame) -> dict:
+def category_followup(question, frame, active_steps, previous_result):
+    """Resolve a short category follow-up from observed labels and the previous calculation."""
+    text = question.strip().rstrip("。.!！?？").strip()
+    prefix = FOLLOWUP_PREFIX.match(text)
+    if not prefix and not previous_result and not text.endswith(("呢", "吗")):
+        return [], None
+    text = FOLLOWUP_PREFIX.sub("", text).rstrip("呢吗").strip()
+    if not any(step["tool"] == "filter_rows" for step in active_steps):
+        return [], None
+    conditions, remainder = label_conditions(text, frame)
+    remainder = remainder.strip(" 的")
+    if len(conditions) != 1:
+        return [], None
+    named_task, simple = literal_measure(remainder, frame)
+    if simple and named_task:
+        return conditions, named_task
+    if not FOLLOWUP_STATISTIC.fullmatch(remainder):
+        return [], None
+    if previous_result and (metric := previous_result.get("column_statistic")):
+        task = RowTask(action="aggregate_column", value_column=metric["value_column"],
+                       statistic="mean" if remainder else metric["statistic"]).model_dump()
+    elif not remainder and previous_result and "row_count" in previous_result:
+        task = RowTask(action="count_rows").model_dump()
+    else:
+        task = None
+    return conditions, task
+
+
+def parse_request_scope(question: str, frame, *, labels_frame=None) -> dict:
     text_only = bool(TEXT_ONLY.search(question))
     show_filtered_rows = bool(FILTER_WRAPPER.search(question))
     question = TEXT_ONLY.sub("", question)
@@ -302,7 +333,7 @@ def parse_request_scope(question: str, frame) -> dict:
         labels = []
         if scoped and FILLER.sub("", remaining).strip():
             prefix = cue.group(0) + " " if cue and EXCLUDE.fullmatch(cue.group(0)) else ""
-            labels, remaining = label_conditions(prefix + remaining, frame)
+            labels, remaining = label_conditions(prefix + remaining, frame if labels_frame is None else labels_frame)
         if in_scope and not cue and not explicit and not labels and (
             boundary == 0 or literal_measure(text, frame)[1]
         ):
@@ -320,7 +351,9 @@ def parse_request_scope(question: str, frame) -> dict:
         conditions = []
     action = None
     count_text = INCLUDE_MISSING.sub("", EXPLICIT_ROW_COUNT.sub("", question))
-    direct_count = bool(EXPLICIT_ROW_COUNT.search(question)) and not re.search(r"\w", SIMPLE_MEASURE_WORDS.sub("", count_text))
+    direct_count = bool(REFERENCE_COUNT.fullmatch(question.strip())) or (
+        bool(EXPLICIT_ROW_COUNT.search(question)) and not re.search(r"\w", SIMPLE_MEASURE_WORDS.sub("", count_text))
+    )
     if not GROUP_QUESTION.search(question):
         if COUNT_QUESTION.search(question) or direct_count:
             action = "count_rows"

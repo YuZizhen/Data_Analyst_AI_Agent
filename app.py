@@ -118,6 +118,10 @@ def working_table(dataset: Dataset) -> PreparedDataset | None:
     return st.session_state.get("working_table", selected)
 
 
+def scope_filter_text(conditions) -> str:
+    return " · ".join(describe_call("filter_rows", condition).details[0].rstrip("。") for condition in conditions)
+
+
 def save_working_table(store: TableStore, dataset: Dataset, prepared: PreparedDataset, provider: str) -> SavedTable:
     saved = store.save_prepared(dataset.original, prepared)
     st.session_state.select_table_next = saved.key
@@ -166,7 +170,9 @@ def analyze(
         with TemporaryDirectory(prefix="analyst-") as directory:
             context = AnalysisContext(dataset.source_frame, dataset.original.name, Path(directory).resolve())
             graph = build_analysis_graph(model, context)
-            inputs = {"messages": [*history, HumanMessage(content=analysis_question)], "prepared": prepared_before}
+            selected = PreparedDataset(dataset.frame, dataset.selected.steps) if dataset.selected.steps else None
+            inputs = {"messages": [*history, HumanMessage(content=analysis_question)], "prepared": prepared_before,
+                      "selected_version": selected}
             result = inputs
             for mode, event in graph.stream(inputs, stream_mode=["updates", "values", "custom"]):
                 if mode == "values":
@@ -198,7 +204,12 @@ def analyze(
         after_steps = list(prepared_after.steps) if prepared_after is not None else []
         temporary = after_steps != list(dataset.selected.steps)
         saved = None
-        if save_requested:
+        if result.get("pending_scope_choice") and save_requested:
+            answer = messages[-1]
+            messages[-1] = answer.model_copy(update={"response_metadata": {**answer.response_metadata, "save_requested": True}})
+        if result["request_scope"].get("scope_choice") and history and isinstance(history[-1], AIMessage):
+            save_requested = save_requested or history[-1].response_metadata.get("save_requested", False)
+        if save_requested and not result.get("pending_scope_choice"):
             validation = result.get("validation", [])
             latest_tools = {step["tool"]: step["status"] for step in steps if not step.get("deferred")}
             ready = bool(steps) and "error" not in latest_tools.values() and (
@@ -217,6 +228,22 @@ def analyze(
                 st.session_state.pop("working_table", None)
         trace = None
         if steps:
+            scopes = [
+                item["analysis_scope"] for item in tool_artifacts(messages, rejected)
+                if "analysis_scope" in item
+            ]
+            if not scopes and after_steps != before_steps:
+                scopes = [{"rows": len(output_frame), "steps": after_steps}]
+            analysis_ranges = []
+            for scope in scopes:
+                from_selected = not dataset.selected.steps or scope["steps"][:len(dataset.selected.steps)] == list(dataset.selected.steps)
+                item = {
+                    "table": dataset.selected.label if from_selected else dataset.original.label,
+                    "rows": scope["rows"],
+                    "filters": [step["parameters"] for step in scope["steps"] if step["tool"] == "filter_rows"],
+                }
+                if item not in analysis_ranges:
+                    analysis_ranges.append(item)
             trace = {
                 "version": 1,
                 "dataset": {
@@ -229,6 +256,7 @@ def analyze(
                 "model": {"provider": provider, "name": model_name},
                 "input_table": {"label": input_label, "rows": len(input_frame), "columns": len(input_frame.columns)},
                 "request_scope": result["request_scope"],
+                "analysis_ranges": analysis_ranges,
                 "steps": steps,
             }
             if validation := result.get("validation"):
@@ -362,6 +390,13 @@ def show_execution_record(turn: Turn, trace: dict):
                     st.caption("本轮使用临时分析范围，未创建数据版本。")
                 if saved := working.get("saved_version"):
                     st.caption(f"已保存 {saved}。")
+            if replaced := trace.get("request_scope", {}).get("replaced_conditions"):
+                st.caption("本轮移除或替换的临时筛选")
+                for condition in replaced:
+                    st.text(describe_call("filter_rows", condition).details[0])
+            if confirmed := trace.get("request_scope", {}).get("clarified_question"):
+                st.caption("确认范围前的问题")
+                st.text(confirmed)
             for number, step in enumerate(journey, start=1):
                 with st.container(border=True):
                     st.markdown(f"**{number}. {step['action']}**")
@@ -428,8 +463,13 @@ def show_turn(turn: Turn):
         if turn.error:
             st.error(turn.error)
             return
-        st.markdown(turn.messages[-1].text.strip() or "模型没有返回可显示的回复。")
         trace = getattr(turn, "trace", None)
+        if trace:
+            for scope in trace.get("analysis_ranges", []):
+                st.caption(f"本轮数据 · {scope['table']} · 使用范围 {scope['rows']:,} 行")
+                if filters := scope_filter_text(scope["filters"]):
+                    st.caption(filters)
+        st.markdown(turn.messages[-1].text.strip() or "模型没有返回可显示的回复。")
         if trace and (validation := trace.get("validation")):
             last = validation[-1]["status"]
             label, render = {
@@ -514,6 +554,10 @@ def main():
         frame = prepared.frame if prepared is not None else dataset.source_frame
         if "working_table" in st.session_state:
             st.caption(f"当前对话使用临时分析范围 · {len(frame):,} 行")
+            if prepared is not None:
+                active_filters = [step["parameters"] for step in prepared.steps if step["tool"] == "filter_rows"]
+                if filters := scope_filter_text(active_filters):
+                    st.caption(filters)
             if prepared is not None and st.button("保存当前范围为数据版本", width="stretch"):
                 try:
                     save_working_table(store, dataset, prepared, provider)
@@ -554,6 +598,16 @@ def main():
 
     for turn in st.session_state.turns:
         show_turn(turn)
+
+    if st.session_state.turns:
+        latest = st.session_state.turns[-1].messages
+        if latest and isinstance(latest[-1], AIMessage):
+            pending = latest[-1].response_metadata.get("scope_choice")
+            if pending and pending["steps"] == list(prepared.steps if prepared is not None else ()):
+                choices = ("沿用刚才的筛选", "按所选表的全部范围")
+                for area, label in zip(st.columns(len(choices)), choices):
+                    if area.button(label, width="stretch"):
+                        example = label
 
     question = st.chat_input("输入你的分析问题…") or example
     if question and question.strip():

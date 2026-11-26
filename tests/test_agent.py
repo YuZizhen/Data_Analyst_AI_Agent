@@ -66,6 +66,60 @@ def test_overall_statistics_execute_on_the_requested_scope(tmp_path, question, o
     assert not model.prompts
 
 
+def test_switching_an_analysis_category_keeps_the_selected_version_bounds(tmp_path):
+    csv = tmp_path / "sales.csv"
+    csv.write_text(
+        "category,region,unit_price\nElectronics,North,100\nFurniture,North,50\nFurniture,South,500\n",
+        encoding="utf-8",
+    )
+    graph = build_agent(ScriptedModel([]), csv_path=csv, output_dir=tmp_path)
+    saved = graph.invoke({"messages": [HumanMessage(content="Only region = North, calculate the average unit price.")]})["prepared"]
+    first = graph.invoke({"messages": [HumanMessage(content="Only category = Electronics, calculate the average unit price.")],
+                          "selected_version": saved, "prepared": saved})
+    history = first["messages"]
+    followup = graph.invoke({"messages": [*history, HumanMessage(content="What about Furniture?")],
+                             "selected_version": saved, "prepared": first["prepared"]})
+    assert followup["prepared"].steps[0] == saved.steps[0]
+    assert followup["prepared"].frame["unit_price"].tolist() == [50]
+    assert "**50**" in followup["messages"][-1].text
+    assert followup["validation"][-1]["status"] == "passed"
+
+
+@pytest.mark.parametrize(("question", "answer", "expected"), [
+    ("What is the average unit price for Furniture?", "所有地区", 275),
+    ("那 Furniture 的均价呢？", "只算 North", 50),
+    ("What is the average unit price for Furniture across all regions?", None, 275),
+    ("Only region = North, category = Furniture. What's the average unit price?", None, 50),
+    ("那 Furniture 的均价呢，沿用刚才的筛选", None, 50),
+    ("What is the average unit price for Decor?", None, 30),
+    ('Only category = "All Regions", calculate the average unit price.', None, 35),
+])
+def test_scope_clarification_respects_explicit_ranges_and_row_sets(tmp_path, question, answer, expected):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("category,region,unit_price\nFurniture,North,50\nFurniture,South,500\nDecor,North,30\nAll Regions,North,35\n",
+                   encoding="utf-8")
+    model = ScriptedModel([])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    first = graph.invoke({"messages": [HumanMessage(content="Only region = North, calculate average unit price.")]})
+    history = first["messages"]
+    result = graph.invoke({"messages": [*history, HumanMessage(content=question)], "prepared": first["prepared"]})
+    if answer:
+        pending = result["messages"][-1].response_metadata["scope_choice"]
+        assert (pending["kept_rows"], pending["wide_rows"]) == (1, 2)
+        assert result["prepared"].steps == first["prepared"].steps
+        assert not tool_trace(result["messages"][len(history):])
+        result = graph.invoke({"messages": [*result["messages"], HumanMessage(content=answer)],
+                               "prepared": result["prepared"]})
+    else:
+        assert not result["messages"][-1].response_metadata.get("scope_choice")
+    assert f"**{expected}**" in result["messages"][-1].text
+    assert result["validation"][-1]["status"] == "passed"
+    assert ("North" in result["prepared"].frame["region"].values) and (
+        ("South" in result["prepared"].frame["region"].values) == (expected == 275)
+    )
+    assert not model.prompts
+
+
 @pytest.mark.parametrize(("question", "value", "rows_used"), [
     ("Only show rows where category is Electronics. What's the average unit price?", 110, 2),
     ("What’s the average unit price where category is Electronics?", 110, 2),
