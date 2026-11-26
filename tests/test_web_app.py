@@ -217,7 +217,6 @@ def test_browser_renders_the_filtered_rows_and_the_formula_totals(monkeypatch):
     assert turn.trace["validation"][-1]["status"] == "passed"
     assert app.selectbox[0].value == entry.key
 
-    next(button for button in app.button if button.label == "清除临时范围").click().run()
     app.chat_input[0].set_value("Which category has the highest total revenue? (revenue = units_sold × unit_price × (1 − discount))").run()
     app.run()
     assert not app.exception
@@ -225,8 +224,15 @@ def test_browser_renders_the_filtered_rows_and_the_formula_totals(monkeypatch):
     step, = turn.trace["steps"]
     assert step["tool"] == "formula_group_totals"
     assert "**16,080.75** (Electronics)" in turn.messages[-1].text
+    assert turn.trace["analysis_ranges"][0]["rows"] == 10
+    assert turn.trace["analysis_ranges"][0]["filters"] == []
+    assert turn.trace["request_scope"]["expanded_for_comparison"] == {
+        "column": "category", "kept_groups": 1, "wide_groups": 3,
+    }
+    assert any("可比较的分组从 1 个增至 3 个" in item.value for item in app.caption)
     assert [round(row["value"], 2) for row in step["evidence"]["group_summary"]["groups"]] == [16080.75, 6678, 3440]
     assert turn.trace["validation"][-1]["status"] == "passed"
+    assert any(item["label"] == "分组比较范围" for item in turn.trace["validation"][-1]["checks"])
     assert not model.prompts
 
 

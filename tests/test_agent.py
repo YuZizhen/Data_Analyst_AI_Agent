@@ -159,6 +159,41 @@ def test_formula_is_evaluated_on_rows_before_grouping(tmp_path, question, field)
     assert result["validation"][-1]["status"] == "passed" and "**110** (B)" in result["messages"][-1].text
 
 
+@pytest.mark.parametrize(("prior_filter", "saved", "choice", "groups", "winner"), [
+    ("segment = A", False, None, 3, "**400** (C)"),
+    ("region = North", False, "keep the previous filters", 2, "**100** (B)"),
+    ("segment = A", True, None, 1, None),
+])
+def test_group_ranking_uses_a_comparable_scope(tmp_path, prior_filter, saved, choice, groups, winner):
+    csv = tmp_path / "sales.csv"
+    csv.write_text("segment,region,units,price\nA,North,1,10\nB,North,2,50\nC,South,4,100\n", encoding="utf-8")
+    model = ScriptedModel([])
+    graph = build_agent(model, csv_path=csv, output_dir=tmp_path)
+    first = graph.invoke({"messages": [HumanMessage(content=f"Only {prior_filter}, calculate the average price.")]})
+    prepared = first["prepared"]
+    question = HumanMessage(content="Which segment has the highest total turnover? (turnover = units * price)")
+    history = [*first["messages"], question]
+    result = graph.invoke({"messages": history, "prepared": prepared, "selected_version": prepared if saved else None})
+    if choice:
+        pending = result["pending_scope_choice"]
+        assert (pending["kept_rows"], pending["wide_rows"]) == (2, 3)
+        assert not tool_trace(result["messages"][len(history):])
+        history = [*result["messages"], HumanMessage(content=choice)]
+        result = graph.invoke({"messages": history, "prepared": prepared})
+    assert result["pending_scope_choice"] is None
+    step, = tool_trace(result["messages"][len(history):])
+    assert step["evidence"]["group_summary"]["group_count"] == groups
+    answer = result["messages"][-1].text
+    if winner:
+        assert winner in answer
+        assert result["validation"][-1]["status"] == "passed"
+    else:
+        assert "one usable group" in answer and "highest" not in answer
+        assert result["validation"][-1]["status"] == "limited"
+        assert result["prepared"].steps == prepared.steps
+    assert not model.prompts
+
+
 def test_unsupported_formula_is_reported_without_calculating_a_different_metric(tmp_path):
     csv = tmp_path / "sales.csv"
     csv.write_text("category,units_sold\nA,10\nB,1\n", encoding="utf-8")
@@ -639,7 +674,8 @@ def test_validation_rejects_chart_for_wrong_scope_and_retries_once(tmp_path, rec
     if recover:
         report, = (artifact for artifact in artifacts if "path" in artifact)
         assert report["group_summary"]["groups"] == [{"group": "hardware", "value": 20.0, "valid_rows": 2}]
-        assert "最高值为 **20**" in result["messages"][-1].text
+        assert "统计值为 **20**" in result["messages"][-1].text
+        assert "一个有效分组" in result["messages"][-1].text
     else:
         assert all("path" not in artifact for artifact in artifacts)
         assert "校验未通过" in result["messages"][-1].text

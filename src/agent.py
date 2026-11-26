@@ -53,6 +53,7 @@ from src.tools import (
 from src.tools.candidates import CONFIRMATION, CANDIDATE_TOOLS, confirmed_fields, review_candidates, review_counts, review_summary
 from src.tools.charts import grouped_answer
 from src.tools.dataset import finite_numbers, numeric_column
+from src.tools.formulas import formula_values
 from src.tools.rows import statistic_answer
 from src.request_scope import DELIMITER, RankFields, ScopeLabels, category_followup, parse_request_scope, resolve_observed_labels, resolve_rank_fields
 from src.tools.preprocessing import PREPARATION_FUNCTIONS, filter_frame
@@ -323,16 +324,38 @@ def compare_requested_ranges(source, prepared, selected, scope):
         narrow_frame, wide_frame = requested_frame(kept), requested_frame(wide)
     except ToolException:
         return None
-    if narrow_frame.empty or wide_frame.empty or narrow_frame.index.equals(wide_frame.index):
+    if wide_frame.empty or narrow_frame.index.equals(wide_frame.index):
         return None
     task = scope["row_task"]
+    filters = [item for item in cleared if item not in replaced]
+    comparison = {"kept_rows": len(narrow_frame), "wide_rows": len(wide_frame), "filters": filters}
+    if group_column := task.get("group_column"):
+        def usable_groups(frame):
+            labels = frame[group_column]
+            if task.get("aggregation") == "count":
+                return labels.nunique(dropna=False)
+            values = formula_values(frame, task["expression"]) if "expression" in task else finite_numbers(frame[task["value_column"]])
+            return labels[values.notna()].nunique(dropna=False)
+
+        try:
+            narrow_groups, wide_groups = (int(usable_groups(frame)) for frame in (narrow_frame, wide_frame))
+        except (KeyError, ToolException):
+            return None
+        if wide_groups < 2 or narrow_groups > wide_groups:
+            return None
+        removes_group_filter = any(item["column_name"] == group_column for item in filters)
+        if narrow_groups < 2 or (removes_group_filter and narrow_groups < wide_groups):
+            comparison["expanded_for_comparison"] = {"column": group_column, "kept_groups": narrow_groups,
+                                                      "wide_groups": wide_groups}
+        return comparison
+    if narrow_frame.empty:
+        return None
     measure = {"aggregate_column": "value_column", "rank_rows": "sort_column"}.get(task["action"])
     if measure:
         field = task[measure]
         if any(field not in frame or not finite_numbers(frame[field]).notna().any() for frame in (narrow_frame, wide_frame)):
             return None
-    return {"kept_rows": len(narrow_frame), "wide_rows": len(wide_frame),
-            "filters": [item for item in cleared if item not in replaced]}
+    return comparison
 
 
 def preview_request_language(text: str) -> str:
@@ -657,15 +680,19 @@ def build_analysis_graph(model, context: AnalysisContext):
             except (*MODEL_ERRORS, NotImplementedError, ValueError):
                 pass
         starting_prepared = prepared
+        task = scope["row_task"]
         if (not pending and not explicit_keep and not explicit_wide and prepared is not None
-                and scope["row_task"] and any(item["source"] != "record_input" for item in scope["conditions"])):
+                and task and (task.get("group_column") or any(item["source"] != "record_input" for item in scope["conditions"]))):
             comparison = compare_requested_ranges(runtime.context.dataset, prepared, selected, scope)
-            if comparison:
+            if comparison and comparison.get("expanded_for_comparison"):
+                scope["expanded_for_comparison"] = comparison["expanded_for_comparison"]
+            elif comparison:
                 pending = {**comparison, "question": question, "steps": list(prepared.steps), "scope": scope}
                 return {"request_scope": scope, "pending_scope_choice": pending, "row_plan": [], "row_step": 0,
                         "input_preparation": list(prepared.steps), "input_working_table": starting_prepared}
         prepared, replaced = rebase_analysis_filters(
-            runtime.context.dataset, prepared, selected, scope, broaden=bool(choice == "wide" or explicit_wide),
+            runtime.context.dataset, prepared, selected, scope,
+            broaden=bool(choice == "wide" or explicit_wide or scope.get("expanded_for_comparison")),
         )
         if replaced:
             scope["replaced_conditions"] = replaced
@@ -762,9 +789,6 @@ def build_analysis_graph(model, context: AnalysisContext):
             if "expression" in groups:
                 explanation = "先逐行计算公式，再按组求和。" if chinese else "The formula is evaluated per row before summing by group."
                 answer = f"{explanation} {answer}"
-                if groups["group_count"] == 1:
-                    note = "当前数据范围只有一个有效分组。" if chinese else "The current scope has only one usable group."
-                    answer = f"{answer} {note}"
         elif ranked := artifact.get("ranked_rows"):
             total = len(ranked["rows"])
             answer = f"已按「{ranked['sort_column']}」列出 **{total:,} 条**符合条件的记录。" if chinese else f"Listed **{total:,} matching records** ordered by {ranked['sort_column']}."

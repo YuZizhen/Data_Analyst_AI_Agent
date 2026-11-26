@@ -75,8 +75,12 @@ MAX_SCHEMA_FIELDS = 40
 MAX_CHOICES_PER_FIELD = 20
 FILTER_WRAPPER = re.compile(r"\b(?:show|keep|include|select|display)\s+(?:the\s+)?(?:rows|records)\s+where\b", re.I)
 FORMULA_DEFINITION = re.compile(r"[（(]\s*([A-Za-z_]\w*)\s*=\s*(.+)[)）]\s*[.。?？!！]?\s*$", re.S)
+FORMULA_GROUP_LEADER = re.compile(
+    r"^\s*which\s+(?P<group>.+?)\s+has\s+(?:the\s+)?highest\s+(?:total|sum of)\s+(?P<measure>.+?)\s*[?？.]*\s*$",
+    re.I,
+)
 FORMULA_GROUPS = (
-    re.compile(r"^\s*which\s+(?P<group>.+?)\s+has\s+(?:the\s+)?highest\s+(?:total|sum of)\s+(?P<measure>.+?)\s*[?？.]*\s*$", re.I),
+    FORMULA_GROUP_LEADER,
     re.compile(r"^\s*(?:(?:show|calculate|give me)\s+)?(?:the\s+)?(?:total|sum of)\s+(?P<measure>.+?)\s+by\s+(?P<group>.+?)\s*[?？.]*\s*$", re.I),
     re.compile(r"^\s*按\s*(?P<group>\w+)\s*(?:分组)?(?:计算|比较|汇总)\s*(?P<measure>\w+)\s*(?:的)?(?:总和|总量|合计)\s*[?？。]*\s*$", re.I),
 )
@@ -385,7 +389,8 @@ def parse_request_scope(question: str, frame, *, labels_frame=None) -> dict:
         group_column = fields.get(group["group"].strip(" `").replace("_", " ").casefold()) if group else None
         action, task, simple = "formula_group_totals", None, False
         if group_column and group["measure"].strip(" `").casefold() == formula[1].casefold():
-            task = {"action": action, "group_column": group_column, "value_column": formula[1], "expression": formula[2].strip()}
+            task = {"action": action, "group_column": group_column, "value_column": formula[1],
+                    "expression": formula[2].strip(), "requires_group_comparison": group.re is FORMULA_GROUP_LEADER}
             simple = True
     return {"conditions": conditions, "unresolved": list(dict.fromkeys(unresolved)),
             "reset": bool(RESET.search(question)), "has_alternatives": alternatives, "text_only": text_only,

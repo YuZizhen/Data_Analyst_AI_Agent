@@ -49,10 +49,15 @@ def grouped_answer(result: dict, *, chinese: bool) -> str:
     shown, all_groups = len(result["groups"]), result["group_count"]
     if chinese:
         metric = f"「{field}」的{zh}" if field else zh
-        line = f"按「{group}」计算{metric}。最高值为 **{value}**（{'、'.join(row['group'] for row in leading)}）。"
+        line = f"按「{group}」计算{metric}。"
+        if all_groups == 1:
+            return f"{line} 当前范围只有「{first['group']}」一个有效分组，统计值为 **{value}**，使用了 {used:,} 条有效记录。"
+        line += f"最高值为 **{value}**（{'、'.join(row['group'] for row in leading)}）。"
         return f"{line} 结果展示 {all_groups:,} 组中的 {shown:,} 组。本次分组统计使用了 {total:,} 条记录中的 **{used:,} 条**有效记录。"
     labels = ", ".join(row["group"] for row in leading)
     metric = f"{en} of {field}" if field else en
+    if all_groups == 1:
+        return f"The {metric} for {first['group']} is **{value}**, using {used:,} valid rows. The current scope has one usable group."
     return (f"Grouped the {metric} by {group}. The highest value is **{value}** ({labels}). "
             f"Showing {shown:,} of {all_groups:,} groups, using {used:,} of {total:,} rows.")
 

@@ -287,6 +287,11 @@ def validate_results(source: pd.DataFrame, messages, normalize_parameters, rejec
         checks.append(check("数据范围", "passed", scope_detail, tool=tool.name))
         scope_checks = verify_requested_scope(source, frame, scope["steps"], input_preparation, request_scope, tool.name, supplied_values)
         checks.extend(scope_checks)
+        if requested.get("requires_group_comparison") and "group_summary" in evidence:
+            group_count = evidence["group_summary"]["group_count"]
+            checks.append(check("分组比较范围", "passed" if group_count >= 2 else "limited",
+                                f"使用了 {group_count:,} 个有效分组。"
+                                + ("至少需要两个有效分组才能比较最高值。" if group_count < 2 else ""), tool=tool.name))
         if any(item["status"] == "failed" for item in scope_checks):
             invalid.add(tool.tool_call_id)
         evidence_to_check.append((tool, evidence, frame))

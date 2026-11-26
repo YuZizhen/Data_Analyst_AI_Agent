@@ -465,6 +465,9 @@ def show_turn(turn: Turn):
             return
         trace = getattr(turn, "trace", None)
         if trace:
+            if expanded := trace.get("request_scope", {}).get("expanded_for_comparison"):
+                st.caption(f"本题要比较「{expanded['column']}」。已放宽上轮临时筛选，可比较的分组从 "
+                           f"{expanded['kept_groups']:,} 个增至 {expanded['wide_groups']:,} 个。")
             for scope in trace.get("analysis_ranges", []):
                 st.caption(f"本轮数据 · {scope['table']} · 使用范围 {scope['rows']:,} 行")
                 if filters := scope_filter_text(scope["filters"]):
